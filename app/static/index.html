@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Ogurcast WhisperX Test</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <main class="layout">
+      <header class="topbar">
+        <h1>Ogurcast WhisperX Test</h1>
+        <div id="statusBadge" class="badge">Проверка...</div>
+      </header>
+
+      <section class="grid">
+        <form id="jobForm" class="panel">
+          <label>
+            <span>Файл аудио/видео</span>
+            <input id="file" name="file" type="file" accept=".mp3,.wav,.m4a,.mp4,.mpeg,.mpga,.webm,.ogg,.flac,.aac,.wma" required>
+          </label>
+
+          <label>
+            <span>Папка вывода</span>
+            <input id="output_dir" name="output_dir" type="text" value="Z:\Ogurcast\outputs">
+          </label>
+
+          <div class="two">
+            <label>
+              <span>Модель</span>
+              <select id="model" name="model">
+                <option value="medium" selected>medium</option>
+                <option value="large-v2">large-v2</option>
+                <option value="large-v3">large-v3</option>
+                <option value="small">small</option>
+              </select>
+            </label>
+
+            <label>
+              <span>Язык</span>
+              <input id="language" name="language" type="text" value="ru">
+            </label>
+          </div>
+
+          <div class="two">
+            <label>
+              <span>Устройство</span>
+              <select id="device" name="device">
+                <option value="cuda" selected>cuda</option>
+                <option value="cpu">cpu</option>
+              </select>
+            </label>
+
+            <label>
+              <span>Compute type</span>
+              <select id="compute_type" name="compute_type">
+                <option value="float16" selected>float16</option>
+                <option value="int8">int8</option>
+                <option value="float32">float32</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="three">
+            <label>
+              <span>Batch size</span>
+              <input id="batch_size" name="batch_size" type="number" min="1" max="64" value="8">
+            </label>
+
+            <label>
+              <span>Минимум спикеров</span>
+              <input id="min_speakers" name="min_speakers" type="number" min="1" value="2">
+            </label>
+
+            <label>
+              <span>Максимум спикеров</span>
+              <input id="max_speakers" name="max_speakers" type="number" min="1" value="2">
+            </label>
+          </div>
+
+          <label class="check">
+            <input id="diarize" name="diarize" type="checkbox" checked>
+            <span>Диаризация</span>
+          </label>
+
+          <label>
+            <span>HF token</span>
+            <input id="hf_token" name="hf_token" type="password" placeholder="оставьте пустым, если задан HF_TOKEN" autocomplete="off">
+          </label>
+
+          <button id="startButton" type="submit">Запустить обработку</button>
+          <p id="formError" class="error" aria-live="polite"></p>
+        </form>
+
+        <aside class="side">
+          <section class="panel">
+            <h2>Состояние</h2>
+            <dl id="health" class="facts"></dl>
+          </section>
+
+          <section class="panel">
+            <h2>Прогресс</h2>
+            <pre id="progress" class="log">Нет активной задачи.</pre>
+          </section>
+        </aside>
+      </section>
+
+      <section class="panel">
+        <h2>Результат</h2>
+        <div id="result">Пока нет результата.</div>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

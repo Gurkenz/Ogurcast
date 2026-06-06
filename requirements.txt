@@ -1,0 +1,10 @@
+whisperx
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+pydantic-settings
+aiofiles
+soundfile
+numpy
+python-dotenv
