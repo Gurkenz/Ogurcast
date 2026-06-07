@@ -33,6 +33,15 @@ cd Z:\Ogurcast
 
 Важно: WhisperX 3.8.6 зависит от `torch~=2.8.0`, поэтому `install_deps.ps1` после установки WhisperX принудительно возвращает CUDA wheels `torch==2.8.0+cu126`, `torchaudio==2.8.0+cu126` и `torchvision==0.23.0+cu126`. Без этого pip может заменить CUDA-сборку на CPU-сборку.
 
+## Тесты
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+`pytest` пишет временные файлы в `Z:\Ogurcast\tmp\pytest`, а не в системный temp.
+
 ## Warmup
 
 ```powershell
@@ -61,6 +70,26 @@ Z:\Ogurcast\logs\warmup.log
 
 ```text
 http://127.0.0.1:7860
+```
+
+## Qwen3 postprocessing
+
+Первый LLM-этап работает через LM Studio OpenAI-compatible API. Qwen3 не скачивается и не запускается приложением: модель должна быть уже загружена в LM Studio.
+
+Defaults:
+
+```text
+OGURCAST_LLM_BASE_URL=http://127.0.0.1:1234/v1
+OGURCAST_LLM_MODEL=qwen3-8b
+OGURCAST_LLM_TEMPERATURE=0.15
+OGURCAST_LLM_TIMEOUT_SEC=120
+OGURCAST_LLM_API_KEY=
+```
+
+В Workbench кнопка `Qwen3: найти правки` вызывает `POST /api/jobs/{job_id}/llm/postprocess`. Модель возвращает только структурированные correction suggestions. Применение правок остается ручным через Review Workbench. Audit каждого LLM-запуска пишется в:
+
+```text
+review\llm_runs\<run_id>\
 ```
 
 ## Выходные файлы

@@ -5,8 +5,9 @@ import platform
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -23,8 +24,20 @@ from app.config import (
     UPLOADS_DIR,
 )
 from app.env_utils import load_project_env
-from app.file_utils import copy_upload_to_disk, resolve_output_root, safe_filename, validate_audio_extension
+from app.file_utils import copy_upload_to_disk, ensure_inside_project, resolve_output_root, safe_filename, validate_audio_extension
 from app.jobs import get_active_job, get_job, start_job
+from app.llm_postprocess import LLMPostprocessError, run_qwen3_postprocess
+from app.review_artifacts import (
+    apply_safe_asr_batch,
+    ensure_review_artifacts,
+    get_entities,
+    get_transcript,
+    get_words,
+    review_artifact_paths,
+    rollback_batch,
+    update_correction,
+    update_entity,
+)
 
 
 load_project_env()
@@ -167,3 +180,147 @@ def job_files(job_id: str) -> dict[str, object]:
         if path.is_file():
             files.append({"name": path.name, "path": str(path)})
     return {"output_dir": str(output_dir), "files": files}
+
+
+def _completed_job_output_dir(job_id: str) -> Path:
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Ошибка: задача не найдена.")
+    if job["status"] != "done" or not job.get("output_dir"):
+        raise HTTPException(status_code=400, detail="Review доступен только после завершения задачи.")
+
+    try:
+        output_dir = ensure_inside_project(Path(str(job["output_dir"])))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not output_dir.is_dir():
+        raise HTTPException(status_code=400, detail="Ошибка: папка результата не найдена.")
+    return output_dir
+
+
+def _review_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, FileNotFoundError):
+        return HTTPException(status_code=400, detail=f"Ошибка: не найден артефакт {Path(str(exc)).name}.")
+    if isinstance(exc, KeyError):
+        return HTTPException(status_code=404, detail="Ошибка: review-объект не найден.")
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=400, detail=str(exc))
+    return HTTPException(status_code=500, detail=f"Ошибка review: {exc}")
+
+
+@app.get("/api/jobs/{job_id}/artifacts")
+def job_artifacts(job_id: str) -> dict[str, object]:
+    output_dir = _completed_job_output_dir(job_id)
+    try:
+        ensure_review_artifacts(output_dir)
+    except Exception as exc:
+        raise _review_error(exc) from exc
+
+    raw_files = [
+        {"name": path.name, "path": str(path)}
+        for path in sorted(output_dir.iterdir())
+        if path.is_file()
+    ]
+    return {
+        "output_dir": str(output_dir),
+        "raw_artifacts": raw_files,
+        "review_artifacts": review_artifact_paths(output_dir),
+    }
+
+
+@app.get("/api/jobs/{job_id}/transcript")
+def job_transcript(job_id: str) -> dict[str, object]:
+    output_dir = _completed_job_output_dir(job_id)
+    try:
+        return get_transcript(output_dir)
+    except Exception as exc:
+        raise _review_error(exc) from exc
+
+
+@app.get("/api/jobs/{job_id}/words")
+def job_words(job_id: str) -> dict[str, object]:
+    output_dir = _completed_job_output_dir(job_id)
+    try:
+        return {"words": get_words(output_dir)}
+    except Exception as exc:
+        raise _review_error(exc) from exc
+
+
+@app.get("/api/jobs/{job_id}/review")
+def job_review(job_id: str) -> dict[str, object]:
+    output_dir = _completed_job_output_dir(job_id)
+    try:
+        return ensure_review_artifacts(output_dir)
+    except Exception as exc:
+        raise _review_error(exc) from exc
+
+
+@app.patch("/api/jobs/{job_id}/corrections/{correction_id}")
+def patch_correction(
+    job_id: str,
+    correction_id: str,
+    payload: dict[str, Any] | None = Body(default=None),
+) -> dict[str, object]:
+    output_dir = _completed_job_output_dir(job_id)
+    try:
+        return update_correction(output_dir, correction_id, payload or {})
+    except Exception as exc:
+        raise _review_error(exc) from exc
+
+
+@app.post("/api/jobs/{job_id}/corrections/apply-safe-asr")
+def post_apply_safe_asr(job_id: str) -> dict[str, object]:
+    output_dir = _completed_job_output_dir(job_id)
+    try:
+        return apply_safe_asr_batch(output_dir)
+    except Exception as exc:
+        raise _review_error(exc) from exc
+
+
+@app.post("/api/jobs/{job_id}/corrections/rollback-batch")
+def post_rollback_batch(
+    job_id: str,
+    payload: dict[str, Any] | None = Body(default=None),
+) -> dict[str, object]:
+    output_dir = _completed_job_output_dir(job_id)
+    batch_id = payload.get("batchId") if payload else None
+    try:
+        return rollback_batch(output_dir, str(batch_id) if batch_id else None)
+    except Exception as exc:
+        raise _review_error(exc) from exc
+
+
+@app.post("/api/jobs/{job_id}/llm/postprocess")
+def post_llm_postprocess(job_id: str) -> dict[str, object]:
+    output_dir = _completed_job_output_dir(job_id)
+    try:
+        return run_qwen3_postprocess(output_dir)
+    except LLMPostprocessError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Ошибка LLM postprocessing ({exc.run_id}): {exc}",
+        ) from exc
+    except Exception as exc:
+        raise _review_error(exc) from exc
+
+
+@app.get("/api/jobs/{job_id}/entities")
+def job_entities(job_id: str) -> dict[str, object]:
+    output_dir = _completed_job_output_dir(job_id)
+    try:
+        return get_entities(output_dir)
+    except Exception as exc:
+        raise _review_error(exc) from exc
+
+
+@app.patch("/api/jobs/{job_id}/entities/{entity_id}")
+def patch_entity(
+    job_id: str,
+    entity_id: str,
+    payload: dict[str, Any] | None = Body(default=None),
+) -> dict[str, object]:
+    output_dir = _completed_job_output_dir(job_id)
+    try:
+        return update_entity(output_dir, entity_id, payload or {})
+    except Exception as exc:
+        raise _review_error(exc) from exc

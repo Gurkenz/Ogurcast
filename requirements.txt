@@ -1,5 +1,6 @@
 whisperx
 fastapi
+httpx
 uvicorn[standard]
 python-multipart
 pydantic

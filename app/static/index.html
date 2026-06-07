@@ -3,93 +3,121 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Ogurcast WhisperX Test</title>
+    <title>Ogurcast</title>
     <link rel="stylesheet" href="/static/styles.css">
   </head>
   <body>
     <main class="layout">
       <header class="topbar">
-        <h1>Ogurcast WhisperX Test</h1>
+        <div>
+          <h1>Ogurcast</h1>
+          <p class="subhead">Локальная расшифровка и проверка текста</p>
+        </div>
         <div id="statusBadge" class="badge">Проверка...</div>
       </header>
 
-      <section class="grid">
-        <form id="jobForm" class="panel">
-          <label>
-            <span>Файл аудио/видео</span>
-            <input id="file" name="file" type="file" accept=".mp3,.wav,.m4a,.mp4,.mpeg,.mpga,.webm,.ogg,.flac,.aac,.wma" required>
+      <section id="startView" class="start-layout">
+        <form id="jobForm" class="panel start-panel">
+          <label id="dropZone" class="drop-zone" for="file" tabindex="0">
+            <input id="file" name="file" class="file-input" type="file" accept=".mp3,.wav,.m4a,.mp4,.mpeg,.mpga,.webm,.ogg,.flac,.aac,.wma" required>
+            <span class="drop-title">Перетащите файл сюда</span>
+            <span id="fileName" class="drop-subtitle">или нажмите для выбора аудио/видео</span>
           </label>
 
-          <label>
-            <span>Папка вывода</span>
-            <input id="output_dir" name="output_dir" type="text" value="Z:\Ogurcast\outputs">
-          </label>
-
-          <div class="two">
+          <fieldset class="speaker-hint">
+            <legend>Спикеры</legend>
             <label>
-              <span>Модель</span>
-              <select id="model" name="model">
-                <option value="medium" selected>medium</option>
-                <option value="large-v2">large-v2</option>
-                <option value="large-v3">large-v3</option>
-                <option value="small">small</option>
-              </select>
+              <input type="radio" name="speaker_hint" value="auto" checked>
+              <span>Авто</span>
             </label>
-
             <label>
-              <span>Язык</span>
-              <input id="language" name="language" type="text" value="ru">
+              <input type="radio" name="speaker_hint" value="one">
+              <span>Один</span>
             </label>
-          </div>
-
-          <div class="two">
             <label>
-              <span>Устройство</span>
-              <select id="device" name="device">
-                <option value="cuda" selected>cuda</option>
-                <option value="cpu">cpu</option>
-              </select>
+              <input type="radio" name="speaker_hint" value="two">
+              <span>Два</span>
             </label>
-
             <label>
-              <span>Compute type</span>
-              <select id="compute_type" name="compute_type">
-                <option value="float16" selected>float16</option>
-                <option value="int8">int8</option>
-                <option value="float32">float32</option>
-              </select>
+              <input type="radio" name="speaker_hint" value="many">
+              <span>Несколько</span>
             </label>
-          </div>
+          </fieldset>
 
-          <div class="three">
-            <label>
-              <span>Batch size</span>
-              <input id="batch_size" name="batch_size" type="number" min="1" max="64" value="8">
-            </label>
-
-            <label>
-              <span>Минимум спикеров</span>
-              <input id="min_speakers" name="min_speakers" type="number" min="1" value="2">
-            </label>
-
-            <label>
-              <span>Максимум спикеров</span>
-              <input id="max_speakers" name="max_speakers" type="number" min="1" value="2">
-            </label>
-          </div>
-
-          <label class="check">
-            <input id="diarize" name="diarize" type="checkbox" checked>
-            <span>Диаризация</span>
-          </label>
-
-          <label>
-            <span>HF token</span>
-            <input id="hf_token" name="hf_token" type="password" placeholder="оставьте пустым, если задан HF_TOKEN" autocomplete="off">
-          </label>
-
-          <button id="startButton" type="submit">Запустить обработку</button>
+          <button id="startButton" type="submit">Начать обработку</button>
           <p id="formError" class="error" aria-live="polite"></p>
+
+          <details class="dev-settings">
+            <summary>Developer settings</summary>
+
+            <label>
+              <span>Папка вывода</span>
+              <input id="output_dir" name="output_dir" type="text" value="Z:\Ogurcast\outputs">
+            </label>
+
+            <div class="two">
+              <label>
+                <span>Модель</span>
+                <select id="model" name="model">
+                  <option value="medium" selected>medium</option>
+                  <option value="large-v2">large-v2</option>
+                  <option value="large-v3">large-v3</option>
+                  <option value="small">small</option>
+                </select>
+              </label>
+
+              <label>
+                <span>Язык</span>
+                <input id="language" name="language" type="text" value="ru">
+              </label>
+            </div>
+
+            <div class="two">
+              <label>
+                <span>Устройство</span>
+                <select id="device" name="device">
+                  <option value="cuda" selected>cuda</option>
+                  <option value="cpu">cpu</option>
+                </select>
+              </label>
+
+              <label>
+                <span>Compute type</span>
+                <select id="compute_type" name="compute_type">
+                  <option value="float16" selected>float16</option>
+                  <option value="int8">int8</option>
+                  <option value="float32">float32</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="three">
+              <label>
+                <span>Batch size</span>
+                <input id="batch_size" name="batch_size" type="number" min="1" max="64" value="8">
+              </label>
+
+              <label>
+                <span>Минимум спикеров</span>
+                <input id="min_speakers" name="min_speakers" type="number" min="1" value="2">
+              </label>
+
+              <label>
+                <span>Максимум спикеров</span>
+                <input id="max_speakers" name="max_speakers" type="number" min="1" value="2">
+              </label>
+            </div>
+
+            <label class="check">
+              <input id="diarize" name="diarize" type="checkbox" checked>
+              <span>Диаризация</span>
+            </label>
+
+            <label>
+              <span>HF token</span>
+              <input id="hf_token" name="hf_token" type="password" placeholder="оставьте пустым, если задан HF_TOKEN" autocomplete="off">
+            </label>
+          </details>
         </form>
 
         <aside class="side">
@@ -99,15 +127,52 @@
           </section>
 
           <section class="panel">
-            <h2>Прогресс</h2>
+            <h2>Pipeline status</h2>
             <pre id="progress" class="log">Нет активной задачи.</pre>
           </section>
         </aside>
+
+        <section class="panel result-panel">
+          <h2>Результат</h2>
+          <div id="result">Пока нет результата.</div>
+        </section>
       </section>
 
-      <section class="panel">
-        <h2>Результат</h2>
-        <div id="result">Пока нет результата.</div>
+      <section id="workbenchView" class="workbench" hidden>
+        <div class="workbench-bar">
+          <div id="modeTabs" class="mode-tabs"></div>
+          <div class="workbench-actions">
+            <button id="runQwenButton" type="button" class="secondary">Qwen3: найти правки</button>
+            <button id="applySafeButton" type="button">Применить безопасные ASR</button>
+            <button id="rollbackLatestButton" type="button" class="secondary">Rollback batch</button>
+          </div>
+        </div>
+
+        <div class="review-grid">
+          <aside class="segment-rail">
+            <h2>Сегменты</h2>
+            <div id="segmentRail" class="segment-list"></div>
+          </aside>
+
+          <section class="transcript-surface">
+            <div class="surface-head">
+              <h2 id="editorTitle">Текст</h2>
+              <div id="editorStats" class="muted"></div>
+            </div>
+            <div id="transcriptEditor" class="transcript-editor"></div>
+          </section>
+
+          <aside class="review-queue">
+            <h2 id="queueTitle">Очередь проверки</h2>
+            <div id="reviewQueue" class="queue-list"></div>
+          </aside>
+        </div>
+
+        <div class="audio-placeholder" aria-disabled="true">
+          ▶ 00:00 / 00:00 · скорость 1x · аудио будет подключено отдельным безопасным endpoint
+        </div>
+
+        <div id="popoverLayer" class="popover-layer" hidden></div>
       </section>
     </main>
     <script src="/static/app.js"></script>
