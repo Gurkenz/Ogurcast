@@ -13,8 +13,10 @@ from app.file_utils import ensure_inside_project
 
 REVIEW_DIR_NAME = "review"
 SAFE_BATCH_CATEGORIES = {"ASR_ERROR", "TYPO", "PUNCTUATION"}
+TEXT_CHANGE_CATEGORIES = {"ASR_ERROR", "TYPO", "PUNCTUATION", "FILLER_GARBAGE"}
 CORRECTION_STATUSES = {"pending", "accepted", "rejected", "modified"}
-LLM_SOURCE = "llm_qwen3"
+LLM_SOURCE = "llm_asr_correction"
+AUDIO_FLAG_STATUSES = {"pending", "resolved", "ignored"}
 ENTITY_STATUSES = {"pending", "accepted", "rejected", "modified"}
 ENTITY_VERIFICATION_STATUSES = {
     "new",
@@ -84,6 +86,10 @@ def _normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _is_noop_text_change(original: Any, suggested: Any) -> bool:
+    return _normalize_whitespace(_text(original)).casefold() == _normalize_whitespace(_text(suggested)).casefold()
+
+
 def _correction_key(correction: dict[str, Any]) -> tuple[str, str, str, str]:
     return (
         _text(correction.get("segmentId")),
@@ -139,7 +145,8 @@ def _normalize_segments(raw_segments: list[Any]) -> list[dict[str, Any]]:
                 "start": _float(raw_segment.get("start")),
                 "end": _float(raw_segment.get("end")),
                 "speaker": _segment_speaker(raw_segment),
-                "text": _text(raw_segment.get("text")),
+                "sourceText": _text(raw_segment.get("text")),
+                "text": _normalize_whitespace(_text(raw_segment.get("text"))),
                 "words": words,
             }
         )
@@ -188,59 +195,38 @@ def _new_correction(
 
 
 def _generate_corrections(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    corrections = []
+    return []
+
+
+def _generate_audio_flags(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    flags = []
     next_index = 1
-
     for segment in segments:
-        original = segment["text"]
-        normalized = _normalize_whitespace(original)
-        if original and normalized and normalized != original:
-            corrections.append(
-                _new_correction(
-                    index=next_index,
-                    segment_id=segment["id"],
-                    category="PUNCTUATION",
-                    severity="low",
-                    confidence=0.99,
-                    original_text=original,
-                    suggested_text=normalized,
-                    reason="Безопасная нормализация пробелов внутри сегмента.",
-                    requires_audio_review=False,
-                    can_batch_apply=True,
-                    start_time=segment["start"],
-                    end_time=segment["end"],
-                )
-            )
-            next_index += 1
-
-        for word in segment["words"]:
+        for word in segment.get("words", []):
             score = word.get("score")
             if not isinstance(score, (int, float)) or score >= 0.75:
                 continue
-            word_text = word.get("word") or ""
+            word_text = _text(word.get("word")).strip()
             if not word_text:
                 continue
-            corrections.append(
-                _new_correction(
-                    index=next_index,
-                    segment_id=segment["id"],
-                    category="NEEDS_LISTENING",
-                    severity="medium",
-                    confidence=max(0.0, min(1.0, float(score))),
-                    original_text=word_text,
-                    suggested_text=word_text,
-                    reason="Низкая уверенность ASR; требуется прослушивание.",
-                    requires_audio_review=True,
-                    can_batch_apply=False,
-                    start_time=word["start"],
-                    end_time=word["end"],
-                    word_start_id=word["id"],
-                    word_end_id=word["id"],
-                )
+            flags.append(
+                {
+                    "id": f"flag-{next_index:06d}",
+                    "segmentId": segment["id"],
+                    "category": "LOW_ASR_CONFIDENCE",
+                    "severity": "medium",
+                    "confidence": max(0.0, min(1.0, float(score))),
+                    "text": word_text,
+                    "reason": "Низкая уверенность ASR; проверьте по аудио только если контекст не снимает сомнение.",
+                    "status": "pending",
+                    "startTime": word["start"],
+                    "endTime": word["end"],
+                    "wordStartId": word["id"],
+                    "wordEndId": word["id"],
+                }
             )
             next_index += 1
-
-    return corrections
+    return flags
 
 
 def _entity_type(surface: str) -> str:
@@ -323,6 +309,43 @@ def _generate_speakers(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _speaker_display_map(speakers: list[dict[str, Any]]) -> dict[str, str]:
+    mapping = {}
+    for speaker in speakers:
+        label = _text(speaker.get("label"))
+        if not label:
+            continue
+        mapping[label] = _text(speaker.get("displayName")) or label
+    return mapping
+
+
+def _speaker_turns(segments: list[dict[str, Any]], speakers: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    display = _speaker_display_map(speakers or [])
+    turns: list[dict[str, Any]] = []
+    for segment in segments:
+        speaker = _text(segment.get("speaker")) or "UNKNOWN"
+        text = _text(segment.get("text")).strip()
+        if not text:
+            continue
+        if turns and turns[-1]["speaker"] == speaker:
+            turns[-1]["end"] = _float(segment.get("end"), turns[-1]["end"])
+            turns[-1]["segmentIds"].append(segment["id"])
+            turns[-1]["text"] = _normalize_whitespace(f"{turns[-1]['text']} {text}")
+        else:
+            turns.append(
+                {
+                    "id": f"turn-{len(turns) + 1:06d}",
+                    "speaker": speaker,
+                    "displayName": display.get(speaker, speaker),
+                    "start": _float(segment.get("start")),
+                    "end": _float(segment.get("end")),
+                    "segmentIds": [segment["id"]],
+                    "text": text,
+                }
+            )
+    return turns
+
+
 def _approved_transcript(segments: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "version": 1,
@@ -340,6 +363,94 @@ def _approved_transcript(segments: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _migrate_review_artifacts(output_dir: Path) -> None:
+    review_dir = _review_dir(output_dir)
+    transcript_path = review_dir / "transcript_normalized.json"
+    corrections_path = review_dir / "correction_suggestions.json"
+    approved_path = review_dir / "approved_transcript.json"
+    flags_path = review_dir / "audio_flags.json"
+    speakers_path = review_dir / "speaker_profiles.json"
+
+    transcript = _read_json(transcript_path)
+    segments = transcript.get("segments", [])
+    changed_transcript = False
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        text = _text(segment.get("text"))
+        normalized = _normalize_whitespace(text)
+        if normalized != text:
+            segment.setdefault("sourceText", text)
+            segment["text"] = normalized
+            changed_transcript = True
+    if changed_transcript:
+        transcript["updatedAt"] = _now()
+        _write_json(transcript_path, transcript)
+
+    if approved_path.exists():
+        approved = _read_json(approved_path)
+        changed_approved = False
+        for segment in approved.get("segments", []):
+            if not isinstance(segment, dict):
+                continue
+            text = _text(segment.get("text"))
+            normalized = _normalize_whitespace(text)
+            if normalized != text:
+                segment["text"] = normalized
+                changed_approved = True
+        if changed_approved:
+            approved["updatedAt"] = _now()
+            _write_json(approved_path, approved)
+
+    if corrections_path.exists():
+        corrections_data = _read_json(corrections_path)
+        corrections = corrections_data.get("corrections", [])
+        if isinstance(corrections, list):
+            filtered = [
+                correction
+                for correction in corrections
+                if not (
+                    isinstance(correction, dict)
+                    and (
+                        correction.get("category") == "NEEDS_LISTENING"
+                        or (
+                            correction.get("category") in TEXT_CHANGE_CATEGORIES
+                            and _is_noop_text_change(correction.get("originalText"), correction.get("suggestedText"))
+                        )
+                    )
+                )
+            ]
+            if len(filtered) != len(corrections):
+                corrections_data["corrections"] = filtered
+                corrections_data["updatedAt"] = _now()
+                _write_json(corrections_path, corrections_data)
+
+    flags = _generate_audio_flags([segment for segment in segments if isinstance(segment, dict)])
+    if not flags_path.exists():
+        _write_json(flags_path, {"version": 1, "updatedAt": _now(), "flags": flags})
+
+    speakers_data = _read_json(speakers_path)
+    speakers = speakers_data.get("speakers", [])
+    if isinstance(speakers, list):
+        labels = {speaker.get("label") for speaker in speakers if isinstance(speaker, dict)}
+        missing = sorted({_text(segment.get("speaker")) for segment in segments if isinstance(segment, dict) and segment.get("speaker")} - labels)
+        if missing:
+            next_index = len(speakers) + 1
+            for label in missing:
+                speakers.append(
+                    {
+                        "id": f"speaker-{next_index:03d}",
+                        "label": label,
+                        "displayName": None,
+                        "linkedEntityId": None,
+                        "verificationStatus": "new",
+                    }
+                )
+                next_index += 1
+            speakers_data["updatedAt"] = _now()
+            _write_json(speakers_path, speakers_data)
+
+
 def ensure_review_artifacts(output_dir: Path) -> dict[str, Any]:
     output_dir = ensure_inside_project(Path(output_dir))
     raw_segments = _read_json(_required_output_path(output_dir, "segments.json"))
@@ -349,6 +460,7 @@ def ensure_review_artifacts(output_dir: Path) -> dict[str, Any]:
 
     transcript_path = review_dir / "transcript_normalized.json"
     corrections_path = review_dir / "correction_suggestions.json"
+    flags_path = review_dir / "audio_flags.json"
     entities_path = review_dir / "entity_annotations.json"
     speakers_path = review_dir / "speaker_profiles.json"
     batches_path = review_dir / "edit_batches.json"
@@ -363,6 +475,8 @@ def ensure_review_artifacts(output_dir: Path) -> dict[str, Any]:
 
     if not corrections_path.exists():
         _write_json(corrections_path, {"version": 1, "updatedAt": created_at, "corrections": _generate_corrections(segments)})
+    if not flags_path.exists():
+        _write_json(flags_path, {"version": 1, "updatedAt": created_at, "flags": _generate_audio_flags(segments)})
     if not entities_path.exists():
         _write_json(entities_path, {"version": 1, "updatedAt": created_at, "entities": _generate_entities(segments)})
     if not speakers_path.exists():
@@ -383,6 +497,7 @@ def ensure_review_artifacts(output_dir: Path) -> dict[str, Any]:
             },
         )
 
+    _migrate_review_artifacts(output_dir)
     return get_review_bundle(output_dir)
 
 
@@ -391,6 +506,7 @@ def review_artifact_paths(output_dir: Path) -> dict[str, str]:
     names = (
         "transcript_normalized.json",
         "correction_suggestions.json",
+        "audio_flags.json",
         "entity_annotations.json",
         "speaker_profiles.json",
         "edit_batches.json",
@@ -404,14 +520,22 @@ def review_artifact_paths(output_dir: Path) -> dict[str, str]:
 
 def get_review_bundle(output_dir: Path) -> dict[str, Any]:
     review_dir = _review_dir(output_dir)
+    transcript = _read_json(review_dir / "transcript_normalized.json")
+    speakers = _read_json(review_dir / "speaker_profiles.json")
     return {
         "outputDir": str(ensure_inside_project(Path(output_dir))),
         "reviewDir": str(review_dir),
-        "transcript": _read_json(review_dir / "transcript_normalized.json"),
+        "transcript": transcript,
+        "words": _read_json(_required_output_path(Path(output_dir), "words.json")),
         "approvedTranscript": _read_json(review_dir / "approved_transcript.json"),
         "corrections": _read_json(review_dir / "correction_suggestions.json"),
+        "audioFlags": _read_json(review_dir / "audio_flags.json"),
         "entities": _read_json(review_dir / "entity_annotations.json"),
-        "speakers": _read_json(review_dir / "speaker_profiles.json"),
+        "speakers": speakers,
+        "speakerTurns": {
+            "version": 1,
+            "turns": _speaker_turns(transcript.get("segments", []), speakers.get("speakers", [])),
+        },
         "editBatches": _read_json(review_dir / "edit_batches.json"),
         "reviewState": _read_json(review_dir / "review_state.json"),
     }
@@ -432,7 +556,12 @@ def get_entities(output_dir: Path) -> dict[str, Any]:
     return _read_json(_review_dir(Path(output_dir)) / "entity_annotations.json")
 
 
-def merge_llm_corrections(output_dir: Path, run_id: str, suggestions: list[dict[str, Any]]) -> dict[str, Any]:
+def merge_llm_corrections(
+    output_dir: Path,
+    run_id: str,
+    suggestions: list[dict[str, Any]],
+    source: str = LLM_SOURCE,
+) -> dict[str, Any]:
     ensure_review_artifacts(output_dir)
     review_dir = _review_dir(Path(output_dir))
     corrections_path = review_dir / "correction_suggestions.json"
@@ -462,6 +591,15 @@ def merge_llm_corrections(output_dir: Path, run_id: str, suggestions: list[dict[
         if segment is None:
             skipped.append({"segmentId": segment_id, "reason": "segment_not_found"})
             continue
+        if suggestion.get("category") == "NEEDS_LISTENING":
+            skipped.append({"segmentId": segment_id, "reason": "listen_flag_not_correction"})
+            continue
+        if suggestion.get("category") in TEXT_CHANGE_CATEGORIES and _is_noop_text_change(
+            suggestion.get("originalText"),
+            suggestion.get("suggestedText"),
+        ):
+            skipped.append({"segmentId": segment_id, "reason": "noop_text_change"})
+            continue
         key = _correction_key(suggestion)
         if key in existing_keys:
             skipped.append({"segmentId": segment_id, "reason": "duplicate"})
@@ -479,7 +617,7 @@ def merge_llm_corrections(output_dir: Path, run_id: str, suggestions: list[dict[
             "requiresAudioReview": bool(suggestion["requiresAudioReview"]),
             "canBatchApply": bool(suggestion["canBatchApply"]),
             "status": "pending",
-            "source": LLM_SOURCE,
+            "source": source,
             "sourceRunId": run_id,
             "startTime": segment.get("start"),
             "endTime": segment.get("end"),
@@ -713,3 +851,82 @@ def update_entity(output_dir: Path, entity_id: str, payload: dict[str, Any]) -> 
     entities_data["updatedAt"] = _now()
     _write_json(review_dir / "entity_annotations.json", entities_data)
     return {"entity": changed_entity}
+
+
+def _ensure_speaker_profile(speakers_data: dict[str, Any], label: str) -> dict[str, Any]:
+    speakers = speakers_data.setdefault("speakers", [])
+    if not isinstance(speakers, list):
+        raise ValueError("speaker_profiles.json поврежден.")
+    for speaker in speakers:
+        if isinstance(speaker, dict) and speaker.get("label") == label:
+            return speaker
+    speaker = {
+        "id": f"speaker-{len(speakers) + 1:03d}",
+        "label": label,
+        "displayName": None,
+        "linkedEntityId": None,
+        "verificationStatus": "new",
+    }
+    speakers.append(speaker)
+    return speaker
+
+
+def update_speaker(output_dir: Path, speaker_label: str, payload: dict[str, Any]) -> dict[str, Any]:
+    ensure_review_artifacts(output_dir)
+    review_dir = _review_dir(Path(output_dir))
+    speakers_data = _read_json(review_dir / "speaker_profiles.json")
+    speaker = _ensure_speaker_profile(speakers_data, speaker_label)
+
+    if "displayName" in payload:
+        display_name = payload["displayName"]
+        if display_name is not None and not isinstance(display_name, str):
+            raise ValueError("displayName должен быть строкой.")
+        speaker["displayName"] = display_name.strip() if isinstance(display_name, str) and display_name.strip() else None
+    if "verificationStatus" in payload:
+        verification_status = str(payload["verificationStatus"])
+        if verification_status not in ENTITY_VERIFICATION_STATUSES:
+            raise ValueError("Некорректный статус проверки speaker.")
+        speaker["verificationStatus"] = verification_status
+
+    speakers_data["updatedAt"] = _now()
+    _write_json(review_dir / "speaker_profiles.json", speakers_data)
+    return {"speaker": speaker, "speakerTurns": _speaker_turns(_read_json(review_dir / "transcript_normalized.json").get("segments", []), speakers_data.get("speakers", []))}
+
+
+def reassign_segment_speaker(output_dir: Path, segment_id: str, speaker_label: str) -> dict[str, Any]:
+    ensure_review_artifacts(output_dir)
+    review_dir = _review_dir(Path(output_dir))
+    transcript = _read_json(review_dir / "transcript_normalized.json")
+    approved = _read_json(review_dir / "approved_transcript.json")
+    speakers_data = _read_json(review_dir / "speaker_profiles.json")
+    _ensure_speaker_profile(speakers_data, speaker_label)
+
+    changed = False
+    for segment in transcript.get("segments", []):
+        if isinstance(segment, dict) and segment.get("id") == segment_id:
+            segment["speaker"] = speaker_label
+            for word in segment.get("words", []):
+                if isinstance(word, dict):
+                    word["speaker"] = speaker_label
+            changed = True
+            break
+    if not changed:
+        raise KeyError(segment_id)
+
+    for segment in approved.get("segments", []):
+        if isinstance(segment, dict) and segment.get("id") == segment_id:
+            segment["speaker"] = speaker_label
+            break
+
+    now = _now()
+    transcript["updatedAt"] = now
+    approved["updatedAt"] = now
+    speakers_data["updatedAt"] = now
+    _write_json(review_dir / "transcript_normalized.json", transcript)
+    _write_json(review_dir / "approved_transcript.json", approved)
+    _write_json(review_dir / "speaker_profiles.json", speakers_data)
+    return {
+        "segmentId": segment_id,
+        "speaker": speaker_label,
+        "speakerTurns": _speaker_turns(transcript.get("segments", []), speakers_data.get("speakers", [])),
+    }

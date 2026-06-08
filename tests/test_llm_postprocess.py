@@ -96,12 +96,13 @@ def test_llm_postprocess_merges_suggestions_and_preserves_raw_artifacts(output_d
 
     assert result["addedCount"] == 1
     assert (Path(result["auditDir"]) / "input.json").is_file()
-    assert (Path(result["auditDir"]) / "request_redacted.json").is_file()
+    assert (Path(result["auditDir"]) / "profile_snapshot.json").is_file()
+    assert (Path(result["auditDir"]) / "request_redacted_001.json").is_file()
     assert (Path(result["auditDir"]) / "validated_response.json").is_file()
 
     corrections = _read_json(output_dir / "review" / "correction_suggestions.json")["corrections"]
     llm_correction = [item for item in corrections if item.get("sourceRunId") == result["runId"]][0]
-    assert llm_correction["source"] == "llm_qwen3"
+    assert llm_correction["source"] == "llm_asr_correction"
     assert llm_correction["status"] == "pending"
     assert llm_correction["id"].startswith("corr-")
     assert "startTime" in llm_correction
@@ -154,4 +155,38 @@ def test_invalid_llm_payload_fails_before_merge(output_dir: Path) -> None:
 
     assert (exc_info.value.audit_dir / "error.json").is_file()
     corrections = _read_json(output_dir / "review" / "correction_suggestions.json")["corrections"]
-    assert not any(item.get("source") == "llm_qwen3" for item in corrections)
+    assert not any(item.get("source") == "llm_asr_correction" for item in corrections)
+
+
+def test_wrong_segment_id_is_skipped_without_mutating_review(output_dir: Path) -> None:
+    payload = _llm_payload()
+    payload["corrections"][0]["segmentId"] = "seg-missing"
+
+    result = run_qwen3_postprocess(output_dir, client=FakeLLMClient(payload))
+
+    assert result["addedCount"] == 0
+    assert result["skippedCount"] == 1
+    assert result["skippedCorrections"][0]["reason"] == "segment_not_found"
+
+
+def test_noop_llm_suggestion_is_skipped(output_dir: Path) -> None:
+    payload = _llm_payload()
+    payload["corrections"][0]["originalText"] = "мочевого"
+    payload["corrections"][0]["suggestedText"] = "мочевого"
+
+    result = run_qwen3_postprocess(output_dir, client=FakeLLMClient(payload))
+
+    assert result["addedCount"] == 0
+    assert result["skippedCorrections"][0]["reason"] == "noop_text_change"
+
+
+def test_listen_only_llm_suggestion_is_not_a_text_correction(output_dir: Path) -> None:
+    payload = _llm_payload()
+    payload["corrections"][0]["category"] = "NEEDS_LISTENING"
+    payload["corrections"][0]["suggestedText"] = "Сереус"
+    payload["corrections"][0]["requiresAudioReview"] = True
+
+    result = run_qwen3_postprocess(output_dir, client=FakeLLMClient(payload))
+
+    assert result["addedCount"] == 0
+    assert result["skippedCorrections"][0]["reason"] == "listen_flag_not_correction"

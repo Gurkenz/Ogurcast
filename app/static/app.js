@@ -20,6 +20,18 @@ const editorTitle = document.getElementById("editorTitle");
 const editorStats = document.getElementById("editorStats");
 const queueTitle = document.getElementById("queueTitle");
 const popoverLayer = document.getElementById("popoverLayer");
+const audioPlayer = document.getElementById("audioPlayer");
+const playbackSpeed = document.getElementById("playbackSpeed");
+const llmStatus = document.getElementById("llmStatus");
+const llmModel = document.getElementById("llmModel");
+const llmTemperature = document.getElementById("llmTemperature");
+const llmTimeout = document.getElementById("llmTimeout");
+const llmStageDescription = document.getElementById("llmStageDescription");
+const llmSystemInstruction = document.getElementById("llmSystemInstruction");
+const llmUserTemplate = document.getElementById("llmUserTemplate");
+const llmSchemaNotes = document.getElementById("llmSchemaNotes");
+const saveLlmProfileButton = document.getElementById("saveLlmProfileButton");
+const llmEventLog = document.getElementById("llmEventLog");
 
 const state = {
   mode: "text",
@@ -27,23 +39,32 @@ const state = {
   transcript: [],
   words: [],
   corrections: [],
+  audioFlags: [],
   entities: [],
   speakers: [],
+  speakerTurns: [],
+  segmentById: new Map(),
+  approvedById: new Map(),
+  availableModels: [],
+  llmReady: false,
   selectedCorrectionId: null,
   selectedEntityId: null,
   selectedSegmentId: null,
   currentTime: 0,
+  audioStopAt: null,
   appliedBatches: [],
   currentJobId: null,
+  llmProfile: null,
+  llmRunPollTimer: null,
 };
 
 const modes = [
   { id: "text", label: "Text" },
   { id: "asr", label: "ASR Review" },
   { id: "entity", label: "Entity Review" },
-  { id: "speaker", label: "Speaker Review", disabled: true },
+  { id: "speaker", label: "Speaker Review" },
   { id: "style", label: "Style Review", disabled: true },
-  { id: "listen", label: "Listen Review", disabled: true },
+  { id: "listen", label: "Listen Review" },
   { id: "final", label: "Final Preview" },
 ];
 
@@ -87,6 +108,14 @@ function formatTime(value) {
     return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   }
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatSeconds(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return "0.0";
+  }
+  return number.toFixed(1);
 }
 
 function truncate(text, limit = 90) {
@@ -145,6 +174,117 @@ async function loadHealth() {
     statusBadge.className = "badge bad";
     health.replaceChildren(el("dt", "", "Ошибка"), el("dd", "", error.message));
   }
+}
+
+function renderLlmStatus(data) {
+  llmStatus.replaceChildren();
+  const availableModels = data.availableModels || [];
+  state.availableModels = availableModels;
+  state.llmReady = Boolean(data.reachable && data.modelLoaded && availableModels.length);
+  const rows = [
+    ["Base URL", data.baseUrl || ""],
+    ["Reachable", boolText(data.reachable)],
+    ["Configured", data.configuredModel || ""],
+    ["Loaded", boolText(data.modelLoaded)],
+    ["Available", (data.availableModels || []).join(", ") || "нет"],
+  ];
+  if (data.error) {
+    rows.push(["Ошибка", data.error]);
+  }
+  for (const [name, value] of rows) {
+    llmStatus.append(el("dt", "", name), el("dd", "", value));
+  }
+  renderLlmModelOptions(data.configuredModel || "");
+}
+
+function renderLlmModelOptions(preferredModel = "") {
+  const previous = llmModel.value || preferredModel;
+  llmModel.replaceChildren();
+  const models = state.availableModels.length ? state.availableModels : [preferredModel].filter(Boolean);
+  for (const model of models) {
+    const option = el("option", "", model);
+    option.value = model;
+    llmModel.append(option);
+  }
+  llmModel.disabled = !state.availableModels.length;
+  if (models.includes(previous)) {
+    llmModel.value = previous;
+  } else if (models.includes(preferredModel)) {
+    llmModel.value = preferredModel;
+  }
+  runQwenButton.disabled = !state.currentJobId || !state.llmReady;
+}
+
+function fillLlmProfile(profile) {
+  if (!profile) {
+    return;
+  }
+  state.llmProfile = profile;
+  renderLlmModelOptions(profile.defaultModel || "");
+  llmTemperature.value = profile.temperature ?? "";
+  llmTimeout.value = profile.timeoutSec ?? "";
+  llmStageDescription.value = profile.stageDescription || "";
+  llmSystemInstruction.value = profile.systemInstruction || "";
+  llmUserTemplate.value = profile.userPayloadTemplate || "";
+  llmSchemaNotes.value = profile.schemaNotes || "";
+}
+
+async function loadLlmDeveloperData() {
+  try {
+    const [status, profiles] = await Promise.all([
+      requestJson("/api/llm/status"),
+      requestJson("/api/llm/profiles"),
+    ]);
+    renderLlmStatus(status);
+    const profile = profiles.effective?.asr_correction || profiles.defaults?.asr_correction;
+    fillLlmProfile(profile);
+  } catch (error) {
+    llmStatus.replaceChildren(el("dt", "", "Ошибка"), el("dd", "", error.message));
+  }
+}
+
+function collectLlmProfilePayload() {
+  return {
+    profileId: state.llmProfile?.profileId || "local-asr-correction",
+    version: Number(state.llmProfile?.version || 1),
+    label: state.llmProfile?.label || "ASR correction",
+    stageDescription: llmStageDescription.value.trim(),
+    systemInstruction: llmSystemInstruction.value.trim(),
+    userPayloadTemplate: llmUserTemplate.value.trim(),
+    schemaNotes: llmSchemaNotes.value.trim(),
+    defaultModel: llmModel.value,
+    temperature: Number(llmTemperature.value),
+    timeoutSec: Number(llmTimeout.value),
+    maxInputChars: Number(state.llmProfile?.maxInputChars || 18000),
+  };
+}
+
+function renderLlmEvents(run) {
+  const events = run?.events || [];
+  if (!events.length) {
+    llmEventLog.textContent = "Нет LLM events.";
+    return;
+  }
+  llmEventLog.textContent = events.map((event) => {
+    const parts = [event.time, event.type];
+    if (event.chunkIndex) {
+      parts.push(`chunk=${event.chunkIndex}/${event.chunkTotal || "?"}`);
+    }
+    if (event.model) {
+      parts.push(`model=${event.model}`);
+    }
+    if (event.addedCount !== undefined) {
+      parts.push(`added=${event.addedCount}`);
+    }
+    if (event.skippedCount !== undefined) {
+      parts.push(`skipped=${event.skippedCount}`);
+    }
+    if (event.error) {
+      parts.push(`error=${event.error}`);
+    }
+    return parts.join(" · ");
+  }).join("\n");
+  llmEventLog.scrollTop = llmEventLog.scrollHeight;
 }
 
 function selectedSpeakerHint() {
@@ -310,8 +450,12 @@ function loadReviewState(data) {
   state.transcript = data.transcript?.segments || [];
   state.words = data.words || [];
   state.corrections = data.corrections?.corrections || [];
+  state.audioFlags = data.audioFlags?.flags || [];
   state.entities = data.entities?.entities || [];
   state.speakers = data.speakers?.speakers || [];
+  state.speakerTurns = data.speakerTurns?.turns || [];
+  state.segmentById = new Map(state.transcript.map((segment) => [segment.id, segment]));
+  state.approvedById = new Map(state.lastApprovedSegments.map((segment) => [segment.id, segment]));
   state.appliedBatches = (data.editBatches?.batches || []).filter((batch) => batch.status === "applied");
   if (!state.selectedSegmentId && state.transcript.length) {
     state.selectedSegmentId = state.transcript[0].id;
@@ -323,8 +467,11 @@ async function loadReview(jobId) {
     const data = await requestJson(`/api/jobs/${jobId}/review`);
     state.currentJobId = jobId;
     loadReviewState(data);
+    audioPlayer.src = `/api/jobs/${jobId}/audio`;
+    audioPlayer.load();
     workbenchView.hidden = false;
     renderWorkbench();
+    await loadLlmDeveloperData();
     workbenchView.scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (error) {
     setError(error.message);
@@ -387,7 +534,7 @@ function renderWorkbench() {
   applySafeButton.textContent = `Применить безопасные ASR (${safeCount})`;
   applySafeButton.disabled = safeCount === 0;
   rollbackLatestButton.disabled = state.appliedBatches.length === 0;
-  runQwenButton.disabled = !state.currentJobId;
+  runQwenButton.disabled = !state.currentJobId || !state.llmReady;
 }
 
 function renderModeTabs() {
@@ -438,9 +585,25 @@ function scrollToSegment(segmentId) {
   }
 }
 
+function playRange(start, end, pad = 3) {
+  if (!audioPlayer.src) {
+    setError("Аудио недоступно для текущей задачи.");
+    return;
+  }
+  const safeStart = Math.max(0, Number(start) - pad);
+  const safeEnd = Math.max(safeStart, Number(end) + pad);
+  state.audioStopAt = Number.isFinite(safeEnd) ? safeEnd : null;
+  audioPlayer.currentTime = Number.isFinite(safeStart) ? safeStart : 0;
+  audioPlayer.play().catch((error) => setError(error.message));
+}
+
 function segmentHeader(segment) {
   const header = el("div", "segment-meta");
-  header.append(el("span", "", formatTime(segment.start)), el("span", "", segment.speaker));
+  header.append(
+    button("▶", "play-button", () => playRange(segment.start, segment.end)),
+    el("span", "", formatTime(segment.start)),
+    el("span", "", segment.speaker),
+  );
   return header;
 }
 
@@ -449,10 +612,53 @@ function approvedText(segment) {
   return approved ? approved.text : segment.text;
 }
 
+function appendWordTokens(container, segment) {
+  const words = Array.isArray(segment.words) ? segment.words : [];
+  if (!words.length) {
+    container.append(document.createTextNode(approvedText(segment)));
+    return;
+  }
+  for (const word of words) {
+    const token = el("span", "word-token", `${word.word || ""} `);
+    token.dataset.wordStart = word.start;
+    token.dataset.wordEnd = word.end;
+    token.dataset.segmentId = segment.id;
+    container.append(token);
+  }
+}
+
 function renderPlainSegment(segment, finalMode = false) {
   const card = el("article", finalMode ? "segment-card final" : "segment-card");
   card.dataset.segmentId = segment.id;
-  card.append(segmentHeader(segment), el("p", "segment-text", approvedText(segment)));
+  card.dataset.segmentStart = segment.start;
+  card.dataset.segmentEnd = segment.end;
+  const body = el("p", "segment-text");
+  appendWordTokens(body, segment);
+  card.append(segmentHeader(segment), body);
+  return card;
+}
+
+function renderSpeakerTurn(turn, finalMode = false) {
+  const card = el("article", finalMode ? "segment-card final speaker-turn" : "segment-card speaker-turn");
+  card.dataset.turnId = turn.id;
+  card.dataset.segmentStart = turn.start;
+  card.dataset.segmentEnd = turn.end;
+  const pseudoSegment = {
+    id: turn.segmentIds?.[0],
+    start: turn.start,
+    end: turn.end,
+    speaker: turn.displayName || turn.speaker,
+  };
+  card.append(segmentHeader(pseudoSegment));
+  for (const segmentId of turn.segmentIds || []) {
+    const segment = state.segmentById.get(segmentId);
+    if (!segment) {
+      continue;
+    }
+    const body = el("p", "segment-text");
+    appendWordTokens(body, segment);
+    card.append(body);
+  }
   return card;
 }
 
@@ -477,33 +683,22 @@ function correctionChip(correction) {
 function renderAsrSegment(segment) {
   const card = el("article", "segment-card");
   card.dataset.segmentId = segment.id;
+  card.dataset.segmentStart = segment.start;
+  card.dataset.segmentEnd = segment.end;
   card.append(segmentHeader(segment));
   const body = el("p", "segment-text inline-review");
-  const source = segment.text || "";
   const corrections = correctionsForSegment(segment.id).filter((correction) => (
-    ["ASR_ERROR", "TYPO", "PUNCTUATION", "FILLER_GARBAGE", "NEEDS_LISTENING"].includes(correction.category)
+    ["ASR_ERROR", "TYPO", "PUNCTUATION", "FILLER_GARBAGE"].includes(correction.category)
   ));
-  let cursor = 0;
-  const trailing = [];
-
-  for (const correction of corrections) {
-    const original = correction.originalText || "";
-    const index = original ? source.indexOf(original, cursor) : -1;
-    if (index >= cursor) {
-      body.append(document.createTextNode(source.slice(cursor, index)));
-      body.append(correctionChip(correction));
-      cursor = index + original.length;
-    } else {
-      trailing.push(correction);
-    }
-  }
-
-  body.append(document.createTextNode(source.slice(cursor)));
-  for (const correction of trailing) {
-    body.append(document.createTextNode(" "));
-    body.append(correctionChip(correction));
-  }
+  appendWordTokens(body, segment);
   card.append(body);
+  if (corrections.length) {
+    const chips = el("div", "correction-strip");
+    for (const correction of corrections) {
+      chips.append(correctionChip(correction));
+    }
+    card.append(chips);
+  }
   return card;
 }
 
@@ -519,6 +714,8 @@ function entityBadge(entity) {
 function renderEntitySegment(segment) {
   const card = el("article", "segment-card");
   card.dataset.segmentId = segment.id;
+  card.dataset.segmentStart = segment.start;
+  card.dataset.segmentEnd = segment.end;
   card.append(segmentHeader(segment));
   const body = el("p", "segment-text inline-review");
   const source = approvedText(segment) || "";
@@ -542,6 +739,73 @@ function renderEntitySegment(segment) {
   for (const entity of trailing) {
     body.append(document.createTextNode(" "));
     body.append(entityBadge(entity));
+  }
+  card.append(body);
+  return card;
+}
+
+function speakerOptions() {
+  const labels = state.speakers.map((speaker) => speaker.label).filter(Boolean);
+  return labels.length ? labels : ["SPEAKER_00", "SPEAKER_01"];
+}
+
+function renderSpeakerTurnEditor(turn) {
+  const card = renderSpeakerTurn(turn);
+  const actions = el("div", "popover-actions");
+  actions.append(
+    button("Переименовать", "secondary", async () => {
+      const value = window.prompt("Имя спикера", turn.displayName || turn.speaker || "");
+      if (value !== null) {
+        await sendJson(`/api/jobs/${state.currentJobId}/speakers/${encodeURIComponent(turn.speaker)}`, "PATCH", {
+          displayName: value.trim() || null,
+          verificationStatus: value.trim() ? "manual_confirmed" : "new",
+        });
+        await reloadReview();
+      }
+    }),
+  );
+  for (const segmentId of turn.segmentIds || []) {
+    const segment = state.segmentById.get(segmentId);
+    if (!segment) {
+      continue;
+    }
+    const row = el("div", "speaker-segment-row");
+    row.append(el("span", "", `${formatTime(segment.start)} ${truncate(segment.text, 52)}`));
+    const select = el("select");
+    for (const speaker of speakerOptions()) {
+      const option = el("option", "", speaker);
+      option.value = speaker;
+      select.append(option);
+    }
+    select.value = segment.speaker;
+    select.addEventListener("change", async () => {
+      await sendJson(`/api/jobs/${state.currentJobId}/segments/${segment.id}/speaker`, "PATCH", { speaker: select.value });
+      await reloadReview();
+    });
+    row.append(select);
+    card.append(row);
+  }
+  card.append(actions);
+  return card;
+}
+
+function renderListenSegment(segment) {
+  const card = el("article", "segment-card");
+  card.dataset.segmentId = segment.id;
+  card.dataset.segmentStart = segment.start;
+  card.dataset.segmentEnd = segment.end;
+  card.append(segmentHeader(segment));
+  const body = el("p", "segment-text inline-review");
+  const words = Array.isArray(segment.words) ? segment.words : [];
+  if (!words.length) {
+    body.textContent = segment.text || "";
+  } else {
+    for (const word of words) {
+      const token = el("span", "word-token", `${word.word || ""} `);
+      token.dataset.wordStart = word.start;
+      token.dataset.wordEnd = word.end;
+      body.append(token);
+    }
   }
   card.append(body);
   return card;
@@ -571,20 +835,42 @@ function renderEditor() {
     return;
   }
 
+  if (state.mode === "speaker") {
+    editorTitle.textContent = "Speaker Review";
+    editorStats.textContent = `Turns: ${state.speakerTurns.length} · speakers: ${state.speakers.length}`;
+    for (const turn of state.speakerTurns) {
+      transcriptEditor.append(renderSpeakerTurnEditor(turn));
+    }
+    updatePlaybackHighlight();
+    return;
+  }
+
+  if (state.mode === "listen") {
+    editorTitle.textContent = "Listen Review";
+    editorStats.textContent = `Аудио: ${formatSeconds(state.currentTime)} sec`;
+    for (const segment of state.transcript) {
+      transcriptEditor.append(renderListenSegment(segment));
+    }
+    updatePlaybackHighlight();
+    return;
+  }
+
   if (state.mode === "final") {
     editorTitle.textContent = "Final Preview";
     editorStats.textContent = "Чистый текст после принятых правок";
-    for (const segment of state.transcript) {
-      transcriptEditor.append(renderPlainSegment(segment, true));
+    for (const turn of state.speakerTurns) {
+      transcriptEditor.append(renderSpeakerTurn(turn, true));
     }
+    updatePlaybackHighlight();
     return;
   }
 
   editorTitle.textContent = "Текст";
-  editorStats.textContent = `Сегменты: ${state.transcript.length} · спикеры: ${state.speakers.length}`;
-  for (const segment of state.transcript) {
-    transcriptEditor.append(renderPlainSegment(segment));
+  editorStats.textContent = `Реплики: ${state.speakerTurns.length} · сегменты: ${state.transcript.length} · спикеры: ${state.speakers.length}`;
+  for (const turn of state.speakerTurns) {
+    transcriptEditor.append(renderSpeakerTurn(turn));
   }
+  updatePlaybackHighlight();
 }
 
 function queueItem(primary, secondary, onClick, tone = "") {
@@ -605,7 +891,14 @@ function renderTextQueue() {
       state.mode = "entity";
       renderWorkbench();
     }),
-    queueItem("Спикеры", `${state.speakers.length} профилей`, null, "muted-item"),
+    queueItem("Прослушивание", `${state.transcript.length} сегментов`, () => {
+      state.mode = "listen";
+      renderWorkbench();
+    }),
+    queueItem("Спикеры", `${state.speakers.length} профилей`, () => {
+      state.mode = "speaker";
+      renderWorkbench();
+    }),
   );
 }
 
@@ -661,12 +954,32 @@ function renderFinalQueue() {
   }
 }
 
+function renderListenQueue() {
+  queueTitle.textContent = "Listen queue";
+  for (const flag of state.audioFlags.filter((item) => item.status !== "ignored")) {
+    reviewQueue.append(queueItem(
+      `${flag.category} · ${flag.status}`,
+      `${formatTime(flag.startTime)} ${truncate(flag.text, 40)}`,
+      () => {
+        state.selectedSegmentId = flag.segmentId;
+        scrollToSegment(flag.segmentId);
+        playRange(flag.startTime, flag.endTime);
+      },
+      "warn-item",
+    ));
+  }
+}
+
 function renderQueue() {
   reviewQueue.replaceChildren();
   if (state.mode === "asr") {
     renderAsrQueue();
   } else if (state.mode === "entity") {
     renderEntityQueue();
+  } else if (state.mode === "listen") {
+    renderListenQueue();
+  } else if (state.mode === "speaker") {
+    renderTextQueue();
   } else if (state.mode === "final") {
     renderFinalQueue();
   } else {
@@ -706,7 +1019,12 @@ function showCorrectionPopover(correction) {
   actions.append(
     button("Применить", "", () => patchCorrection(correction, { status: "accepted" })),
     button("Пропуск", "secondary", () => patchCorrection(correction, { status: "rejected" })),
-    button("Прослушать", "secondary", null, true),
+    button(
+      "Прослушать",
+      "secondary",
+      () => playRange(correction.startTime, correction.endTime),
+      correction.startTime === undefined || correction.endTime === undefined,
+    ),
     button("Свой вариант", "secondary", async () => {
       const value = window.prompt("Свой вариант", correction.suggestedText || correction.originalText || "");
       if (value !== null && value.trim()) {
@@ -751,6 +1069,41 @@ function showEntityPopover(entity) {
   card.append(actions);
 }
 
+function updatePlaybackHighlight() {
+  state.currentTime = Number(audioPlayer.currentTime || 0);
+  const time = state.currentTime;
+
+  for (const card of transcriptEditor.querySelectorAll(".segment-card[data-segment-start]")) {
+    const start = Number(card.dataset.segmentStart);
+    const end = Number(card.dataset.segmentEnd);
+    card.classList.toggle("active-audio", Number.isFinite(start) && Number.isFinite(end) && time >= start && time <= end);
+  }
+
+  for (const token of transcriptEditor.querySelectorAll(".word-token[data-word-start]")) {
+    const start = Number(token.dataset.wordStart);
+    const end = Number(token.dataset.wordEnd);
+    token.classList.toggle("active-word", Number.isFinite(start) && Number.isFinite(end) && time >= start && time <= end);
+  }
+
+  if (state.mode === "listen") {
+    editorStats.textContent = `Аудио: ${formatSeconds(time)} sec`;
+  }
+}
+
+audioPlayer.addEventListener("timeupdate", () => {
+  updatePlaybackHighlight();
+  if (state.audioStopAt !== null && audioPlayer.currentTime >= state.audioStopAt) {
+    audioPlayer.pause();
+    state.audioStopAt = null;
+  }
+});
+
+audioPlayer.addEventListener("seeked", updatePlaybackHighlight);
+
+playbackSpeed.addEventListener("change", () => {
+  audioPlayer.playbackRate = Number(playbackSpeed.value) || 1;
+});
+
 applySafeButton.addEventListener("click", async () => {
   try {
     await sendJson(`/api/jobs/${state.currentJobId}/corrections/apply-safe-asr`, "POST");
@@ -769,6 +1122,43 @@ rollbackLatestButton.addEventListener("click", async () => {
   }
 });
 
+saveLlmProfileButton.addEventListener("click", async () => {
+  setError("");
+  saveLlmProfileButton.disabled = true;
+  try {
+    const data = await sendJson("/api/llm/profiles/asr_correction", "PUT", collectLlmProfilePayload());
+    fillLlmProfile(data.profile);
+    await loadLlmDeveloperData();
+    appendProgressLine("LLM profile сохранен.");
+  } catch (error) {
+    setError(error.message);
+  } finally {
+    saveLlmProfileButton.disabled = false;
+  }
+});
+
+async function pollLlmRun(runId) {
+  const run = await requestJson(`/api/jobs/${state.currentJobId}/llm/runs/${runId}`);
+  renderLlmEvents(run);
+  if (run.status === "done") {
+    clearInterval(state.llmRunPollTimer);
+    state.llmRunPollTimer = null;
+    await reloadReview();
+    state.mode = "asr";
+    renderWorkbench();
+    const summary = run.summary || {};
+    appendProgressLine(`LLM: добавлено ${summary.addedCount || 0}, пропущено ${summary.skippedCount || 0}.`);
+    runQwenButton.textContent = "LLM: найти правки";
+    runQwenButton.disabled = !state.currentJobId;
+  } else if (run.status === "failed") {
+    clearInterval(state.llmRunPollTimer);
+    state.llmRunPollTimer = null;
+    setError(run.error || "Ошибка LLM run.");
+    runQwenButton.textContent = "LLM: найти правки";
+    runQwenButton.disabled = !state.currentJobId;
+  }
+}
+
 runQwenButton.addEventListener("click", async () => {
   if (!state.currentJobId) {
     setError("Сначала откройте завершенный результат.");
@@ -776,17 +1166,30 @@ runQwenButton.addEventListener("click", async () => {
   }
   setError("");
   runQwenButton.disabled = true;
-  runQwenButton.textContent = "Qwen3: обработка...";
+  runQwenButton.textContent = "LLM: обработка...";
   try {
-    const data = await sendJson(`/api/jobs/${state.currentJobId}/llm/postprocess`, "POST");
-    await reloadReview();
-    state.mode = "asr";
-    renderWorkbench();
-    appendProgressLine(`Qwen3: добавлено ${data.addedCount || 0}, пропущено ${data.skippedCount || 0}.`);
+    const payload = {
+      stage: "asr_correction",
+      model: llmModel.value.trim(),
+      temperature: Number(llmTemperature.value),
+      timeoutSec: Number(llmTimeout.value),
+      profileId: state.llmProfile?.profileId || "default-asr-correction",
+    };
+    const run = await sendJson(`/api/jobs/${state.currentJobId}/llm/runs`, "POST", payload);
+    renderLlmEvents(run);
+    state.llmRunPollTimer = setInterval(() => {
+      pollLlmRun(run.run_id).catch((error) => {
+        clearInterval(state.llmRunPollTimer);
+        state.llmRunPollTimer = null;
+        setError(error.message);
+        runQwenButton.textContent = "LLM: найти правки";
+        runQwenButton.disabled = !state.currentJobId;
+      });
+    }, 1000);
+    await pollLlmRun(run.run_id);
   } catch (error) {
     setError(error.message);
-  } finally {
-    runQwenButton.textContent = "Qwen3: найти правки";
+    runQwenButton.textContent = "LLM: найти правки";
     runQwenButton.disabled = !state.currentJobId;
   }
 });
@@ -798,3 +1201,4 @@ popoverLayer.addEventListener("click", (event) => {
 });
 
 loadHealth();
+loadLlmDeveloperData();

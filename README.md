@@ -86,11 +86,57 @@ OGURCAST_LLM_TIMEOUT_SEC=120
 OGURCAST_LLM_API_KEY=
 ```
 
-В Workbench кнопка `Qwen3: найти правки` вызывает `POST /api/jobs/{job_id}/llm/postprocess`. Модель возвращает только структурированные correction suggestions. Применение правок остается ручным через Review Workbench. Audit каждого LLM-запуска пишется в:
+В Workbench кнопка `LLM: найти правки` запускает stage `asr_correction` через `POST /api/jobs/{job_id}/llm/runs`. Модель возвращает только структурированные correction suggestions. Применение правок остается ручным через Review Workbench или через безопасный batch для low-risk ASR corrections.
+
+Developer panel показывает:
+
+- LM Studio base URL, configured model, доступные модели и loaded-state;
+- per-run model/temperature/timeout;
+- редактируемый `system instruction`, `user payload template`, описание стадии и schema notes.
+
+Локальные dev-профили сохраняются в:
+
+```text
+Z:\Ogurcast\config\llm_profiles.local.json
+```
+
+Этот файл исключен из git. Каждый LLM-запуск сохраняет snapshot профиля, request, response, events, prompt hash и metadata в:
 
 ```text
 review\llm_runs\<run_id>\
 ```
+
+Старый endpoint `POST /api/jobs/{job_id}/llm/postprocess` оставлен как compatibility wrapper для stage `asr_correction`.
+
+LLM status API:
+
+```text
+GET /api/llm/status
+GET /api/llm/profiles
+PUT /api/llm/profiles/asr_correction
+POST /api/jobs/{job_id}/llm/runs
+GET /api/jobs/{job_id}/llm/runs/{run_id}
+```
+
+Важно: доступность HTTP endpoint LM Studio не равна готовности модели. `GET /api/llm/status` должен показывать нужную модель в `availableModels` и `modelLoaded=true`. Если LM Studio отдает модель под другим именем, обновите `OGURCAST_LLM_MODEL` в `.env` или выберите фактическое имя модели в developer panel для конкретного запуска.
+
+User-facing correction queue не содержит фоновые нормализации пробелов и no-op правки. Нормализация whitespace применяется при создании review transcript. Низкая уверенность ASR сохраняется отдельно как audio flags, а не как фиктивная правка вида `слово -> слово`.
+
+## Audio review
+
+Для завершенной job Workbench подключает исходный файл через:
+
+```text
+GET /api/jobs/{job_id}/audio
+```
+
+Endpoint отдает только исходный файл из `Z:\Ogurcast\uploads`, найденный через `metadata.json`. Произвольные файлы проекта и path traversal отклоняются. В Listen Review доступны play segment, play correction с окном `±3 sec` и подсветка слов по word-level timestamps.
+
+Скорость playback задается в Workbench через dropdown. Text и Final view показывают speaker turns: соседние сегменты одного speaker объединяются в читаемый блок, но исходные segment IDs и timestamps остаются в review artifacts для playback и ручной проверки.
+
+## Entity verification safety
+
+Автоматического web-поиска сущностей сейчас нет. Entity Review использует только локальные regex-кандидаты из transcript, а кнопка `Искать еще` не выполняет внешних запросов. Будущий web lookup должен быть opt-in по явному клику, без передачи raw audio, локальных путей, секретов или полного transcript, и не должен мутировать transcript напрямую.
 
 ## Выходные файлы
 

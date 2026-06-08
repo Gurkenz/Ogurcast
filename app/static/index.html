@@ -142,11 +142,61 @@
         <div class="workbench-bar">
           <div id="modeTabs" class="mode-tabs"></div>
           <div class="workbench-actions">
-            <button id="runQwenButton" type="button" class="secondary">Qwen3: найти правки</button>
+            <button id="runQwenButton" type="button" class="secondary">LLM: найти правки</button>
             <button id="applySafeButton" type="button">Применить безопасные ASR</button>
             <button id="rollbackLatestButton" type="button" class="secondary">Rollback batch</button>
           </div>
         </div>
+
+        <details class="panel llm-dev-panel">
+          <summary>LLM developer</summary>
+          <div class="llm-grid">
+            <section>
+              <h2>LM Studio</h2>
+              <dl id="llmStatus" class="facts compact"></dl>
+              <div class="three">
+                <label>
+                  <span>Model</span>
+                  <select id="llmModel"></select>
+                </label>
+                <label>
+                  <span>Temperature</span>
+                  <input id="llmTemperature" type="number" min="0" max="2" step="0.01">
+                </label>
+                <label>
+                  <span>Timeout sec</span>
+                  <input id="llmTimeout" type="number" min="1" max="600" step="1">
+                </label>
+              </div>
+            </section>
+
+            <section>
+              <h2>Instruction profile</h2>
+              <label>
+                <span>Stage description</span>
+                <input id="llmStageDescription" type="text" autocomplete="off">
+              </label>
+              <label>
+                <span>System instruction</span>
+                <textarea id="llmSystemInstruction" rows="5"></textarea>
+              </label>
+              <label>
+                <span>User payload template</span>
+                <textarea id="llmUserTemplate" rows="7"></textarea>
+              </label>
+              <label>
+                <span>Schema notes</span>
+                <textarea id="llmSchemaNotes" rows="3"></textarea>
+              </label>
+              <button id="saveLlmProfileButton" type="button" class="secondary">Сохранить профиль</button>
+            </section>
+
+            <section>
+              <h2>LLM events</h2>
+              <pre id="llmEventLog" class="log llm-log">Нет LLM runs.</pre>
+            </section>
+          </div>
+        </details>
 
         <div class="review-grid">
           <aside class="segment-rail">
@@ -168,8 +218,19 @@
           </aside>
         </div>
 
-        <div class="audio-placeholder" aria-disabled="true">
-          ▶ 00:00 / 00:00 · скорость 1x · аудио будет подключено отдельным безопасным endpoint
+        <div class="audio-controls">
+          <audio id="audioPlayer" class="audio-player" controls preload="metadata"></audio>
+          <label class="speed-control">
+            <span>Скорость</span>
+            <select id="playbackSpeed">
+              <option value="0.5">0.5x</option>
+              <option value="0.75">0.75x</option>
+              <option value="1" selected>1x</option>
+              <option value="1.25">1.25x</option>
+              <option value="1.5">1.5x</option>
+              <option value="2">2x</option>
+            </select>
+          </label>
         </div>
 
         <div id="popoverLayer" class="popover-layer" hidden></div>

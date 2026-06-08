@@ -4,6 +4,8 @@ import os
 import platform
 import shutil
 import subprocess
+import json
+import mimetypes
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +28,10 @@ from app.config import (
 from app.env_utils import load_project_env
 from app.file_utils import copy_upload_to_disk, ensure_inside_project, resolve_output_root, safe_filename, validate_audio_extension
 from app.jobs import get_active_job, get_job, start_job
+from app.llm_client import LLMSettings, OpenAICompatibleLLMClient
+from app.llm_profiles import list_profiles, save_local_profile
 from app.llm_postprocess import LLMPostprocessError, run_qwen3_postprocess
+from app.llm_runs import LLMRunRequest, get_llm_run, start_llm_run
 from app.review_artifacts import (
     apply_safe_asr_batch,
     ensure_review_artifacts,
@@ -35,8 +40,10 @@ from app.review_artifacts import (
     get_words,
     review_artifact_paths,
     rollback_batch,
+    reassign_segment_speaker,
     update_correction,
     update_entity,
+    update_speaker,
 )
 
 
@@ -102,6 +109,40 @@ def health() -> dict[str, object]:
         "torch_home": os.getenv("TORCH_HOME"),
         "tmp": os.getenv("TMP"),
     }
+
+
+@app.get("/api/llm/status")
+def llm_status() -> dict[str, object]:
+    settings = LLMSettings.from_env()
+    client = OpenAICompatibleLLMClient(settings)
+    status = client.model_status()
+    return {
+        "baseUrl": settings.base_url,
+        "configuredModel": settings.model,
+        "temperature": settings.temperature,
+        "timeoutSec": settings.timeout_sec,
+        "hasApiKey": bool(settings.api_key),
+        **status,
+    }
+
+
+@app.get("/api/llm/profiles")
+def llm_profiles() -> dict[str, object]:
+    try:
+        return list_profiles()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Ошибка LLM profiles: {exc}") from exc
+
+
+@app.put("/api/llm/profiles/{stage}")
+def put_llm_profile(stage: str, payload: dict[str, Any] | None = Body(default=None)) -> dict[str, object]:
+    try:
+        profile = save_local_profile(stage, payload or {})
+        return {"profile": profile.model_dump(mode="json")}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Ошибка: LLM stage не найден.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/jobs")
@@ -182,6 +223,10 @@ def job_files(job_id: str) -> dict[str, object]:
     return {"output_dir": str(output_dir), "files": files}
 
 
+def _read_json_file(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def _completed_job_output_dir(job_id: str) -> Path:
     job = get_job(job_id)
     if job is None:
@@ -198,6 +243,33 @@ def _completed_job_output_dir(job_id: str) -> Path:
     return output_dir
 
 
+def _completed_job_audio_path(job_id: str) -> Path:
+    output_dir = _completed_job_output_dir(job_id)
+    metadata_path = output_dir / "metadata.json"
+    if not metadata_path.is_file():
+        raise HTTPException(status_code=400, detail="Ошибка: metadata.json не найден.")
+    try:
+        metadata = _read_json_file(metadata_path)
+        input_file = metadata.get("input_file") if isinstance(metadata, dict) else None
+        if not isinstance(input_file, str) or not input_file.strip():
+            raise ValueError("metadata.json не содержит input_file.")
+        audio_path = ensure_inside_project(Path(input_file))
+        uploads_root = UPLOADS_DIR.resolve(strict=False)
+        try:
+            audio_path.resolve(strict=False).relative_to(uploads_root)
+        except ValueError as exc:
+            raise ValueError("Исходное аудио должно находиться внутри uploads.") from exc
+        validate_audio_extension(audio_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Ошибка: metadata.json поврежден.") from exc
+
+    if not audio_path.is_file():
+        raise HTTPException(status_code=404, detail="Ошибка: исходный аудиофайл не найден.")
+    return audio_path
+
+
 def _review_error(exc: Exception) -> HTTPException:
     if isinstance(exc, FileNotFoundError):
         return HTTPException(status_code=400, detail=f"Ошибка: не найден артефакт {Path(str(exc)).name}.")
@@ -206,6 +278,13 @@ def _review_error(exc: Exception) -> HTTPException:
     if isinstance(exc, ValueError):
         return HTTPException(status_code=400, detail=str(exc))
     return HTTPException(status_code=500, detail=f"Ошибка review: {exc}")
+
+
+@app.get("/api/jobs/{job_id}/audio")
+def job_audio(job_id: str) -> FileResponse:
+    audio_path = _completed_job_audio_path(job_id)
+    media_type = mimetypes.guess_type(str(audio_path))[0] or "application/octet-stream"
+    return FileResponse(audio_path, media_type=media_type, filename=audio_path.name)
 
 
 @app.get("/api/jobs/{job_id}/artifacts")
@@ -304,6 +383,28 @@ def post_llm_postprocess(job_id: str) -> dict[str, object]:
         raise _review_error(exc) from exc
 
 
+@app.post("/api/jobs/{job_id}/llm/runs")
+def post_llm_run(
+    job_id: str,
+    payload: dict[str, Any] | None = Body(default=None),
+) -> dict[str, object]:
+    output_dir = _completed_job_output_dir(job_id)
+    try:
+        request = LLMRunRequest.model_validate(payload or {})
+        return start_llm_run(job_id=job_id, output_dir=output_dir, request=request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/jobs/{job_id}/llm/runs/{run_id}")
+def get_job_llm_run(job_id: str, run_id: str) -> dict[str, object]:
+    _completed_job_output_dir(job_id)
+    run = get_llm_run(run_id)
+    if run is None or run.get("job_id") != job_id:
+        raise HTTPException(status_code=404, detail="Ошибка: LLM run не найден.")
+    return run
+
+
 @app.get("/api/jobs/{job_id}/entities")
 def job_entities(job_id: str) -> dict[str, object]:
     output_dir = _completed_job_output_dir(job_id)
@@ -322,5 +423,34 @@ def patch_entity(
     output_dir = _completed_job_output_dir(job_id)
     try:
         return update_entity(output_dir, entity_id, payload or {})
+    except Exception as exc:
+        raise _review_error(exc) from exc
+
+
+@app.patch("/api/jobs/{job_id}/speakers/{speaker_label}")
+def patch_speaker(
+    job_id: str,
+    speaker_label: str,
+    payload: dict[str, Any] | None = Body(default=None),
+) -> dict[str, object]:
+    output_dir = _completed_job_output_dir(job_id)
+    try:
+        return update_speaker(output_dir, speaker_label, payload or {})
+    except Exception as exc:
+        raise _review_error(exc) from exc
+
+
+@app.patch("/api/jobs/{job_id}/segments/{segment_id}/speaker")
+def patch_segment_speaker(
+    job_id: str,
+    segment_id: str,
+    payload: dict[str, Any] | None = Body(default=None),
+) -> dict[str, object]:
+    output_dir = _completed_job_output_dir(job_id)
+    speaker = (payload or {}).get("speaker")
+    if not isinstance(speaker, str) or not speaker.strip():
+        raise HTTPException(status_code=400, detail="speaker обязателен.")
+    try:
+        return reassign_segment_speaker(output_dir, segment_id, speaker.strip())
     except Exception as exc:
         raise _review_error(exc) from exc
