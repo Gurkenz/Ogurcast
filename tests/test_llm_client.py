@@ -67,3 +67,27 @@ def test_complete_json_retries_without_response_format(monkeypatch) -> None:
     assert result["content"]["corrections"] == []
     assert "response_format" in FakeHttpClient.post_payloads[0]
     assert "response_format" not in FakeHttpClient.post_payloads[1]
+
+
+def test_llamacpp_default_ignores_stale_lmstudio_model_when_provider_missing(monkeypatch) -> None:
+    monkeypatch.delenv("OGURCAST_LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("OGURCAST_LLM_BASE_URL", "http://127.0.0.1:1234/v1")
+    monkeypatch.setenv("OGURCAST_LLM_MODEL", "qwen3-8b")
+
+    settings = LLMSettings.from_env()
+
+    assert settings.provider == "llamacpp"
+    assert settings.base_url == "http://127.0.0.1:8080/v1"
+    assert settings.model == "qwen3-8b-q4_k_m.gguf"
+
+
+def test_explicit_lmstudio_provider_keeps_lmstudio_settings(monkeypatch) -> None:
+    monkeypatch.setenv("OGURCAST_LLM_PROVIDER", "lmstudio")
+    monkeypatch.setenv("OGURCAST_LLM_BASE_URL", "http://127.0.0.1:1234/v1")
+    monkeypatch.setenv("OGURCAST_LLM_MODEL", "qwen3-8b")
+
+    settings = LLMSettings.from_env()
+
+    assert settings.provider == "lmstudio"
+    assert settings.base_url == "http://127.0.0.1:1234/v1"
+    assert settings.model == "qwen3-8b"

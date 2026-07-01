@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -12,9 +15,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.file_utils import ensure_inside_project
 from app.llm_client import LLMClientError, LLMSettings, OpenAICompatibleLLMClient
-from app.llm_contract import LLMCorrectionResponse
+from app.llm_contract import LLMAuditResponse, LLMCorrectionResponse
 from app.llm_profiles import LLMProfile, get_profile, profile_hash, render_messages
-from app.review_artifacts import REVIEW_DIR_NAME, ensure_review_artifacts, merge_llm_corrections
+from app.llm_runtime import ensure_llm_runtime
+from app.review_artifacts import REVIEW_DIR_NAME, ensure_review_artifacts, merge_llm_audit_response, merge_llm_corrections
 
 
 class LLMPostprocessError(RuntimeError):
@@ -39,6 +43,7 @@ class LLMRunRequest(BaseModel):
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     timeoutSec: float | None = Field(default=None, gt=0.0, le=600.0)
     profileId: str | None = None
+    auto: bool = False
 
 
 @dataclass
@@ -53,6 +58,8 @@ class LLMRunState:
     started_at: str | None = None
     finished_at: str | None = None
     model: str | None = None
+    auto: bool = False
+    fingerprint: str | None = None
     summary: dict[str, Any] | None = None
     error: str | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
@@ -104,6 +111,7 @@ def start_llm_run(
     job_id: str,
     output_dir: Path,
     request: LLMRunRequest,
+    fingerprint: str | None = None,
     client_factory: Callable[[LLMSettings], LLMClientProtocol] | None = None,
 ) -> dict[str, Any]:
     output_dir = ensure_inside_project(Path(output_dir))
@@ -115,10 +123,23 @@ def start_llm_run(
         stage=request.stage,
         status="queued",
         output_dir=str(output_dir),
+        auto=request.auto,
+        fingerprint=fingerprint,
         audit_dir=str(audit_dir),
     )
     with _lock:
         _runs[run_id] = state
+    _write_json(
+        audit_dir / "metadata.json",
+        {
+            "runId": run_id,
+            "status": "queued",
+            "stage": request.stage,
+            "createdAt": state.created_at,
+            "auto": request.auto,
+            "autoAuditFingerprint": fingerprint,
+        },
+    )
 
     thread = threading.Thread(
         target=_run_llm_thread,
@@ -126,6 +147,7 @@ def start_llm_run(
             "run_id": run_id,
             "output_dir": output_dir,
             "request": request,
+            "fingerprint": fingerprint,
             "client_factory": client_factory,
         },
         daemon=True,
@@ -139,17 +161,31 @@ def _run_llm_thread(
     run_id: str,
     output_dir: Path,
     request: LLMRunRequest,
+    fingerprint: str | None,
     client_factory: Callable[[LLMSettings], LLMClientProtocol] | None,
 ) -> None:
     with _lock:
         state = _runs[run_id]
         state.status = "running"
         state.started_at = _now()
+    _write_json(
+        _audit_dir(output_dir, run_id) / "metadata.json",
+        {
+            "runId": run_id,
+            "status": "running",
+            "stage": request.stage,
+            "createdAt": state.created_at,
+            "startedAt": state.started_at,
+            "auto": request.auto,
+            "autoAuditFingerprint": fingerprint,
+        },
+    )
     try:
         summary = run_llm_stage(
             output_dir,
             request=request,
             run_id=run_id,
+            fingerprint=fingerprint,
             client_factory=client_factory,
         )
         with _lock:
@@ -176,11 +212,39 @@ def _run_llm_thread(
             state.error = message
 
 
+def auto_audit_enabled() -> bool:
+    return os.getenv("OGURCAST_LLM_AUTO_AUDIT", "true").strip().casefold() not in {"0", "false", "no", "off"}
+
+
+def start_auto_llm_audit(
+    *,
+    job_id: str,
+    output_dir: Path,
+    client_factory: Callable[[LLMSettings], LLMClientProtocol] | None = None,
+) -> dict[str, Any]:
+    if not auto_audit_enabled():
+        return {"status": "disabled", "stage": "diarized_asr_audit"}
+    output_dir = ensure_inside_project(Path(output_dir))
+    ensure_review_artifacts(output_dir)
+    fingerprint = _auto_audit_fingerprint(output_dir)
+    existing = _find_existing_auto_audit(output_dir, fingerprint)
+    if existing is not None:
+        return {"status": "deduplicated", "stage": "diarized_asr_audit", "run": existing}
+    return start_llm_run(
+        job_id=job_id,
+        output_dir=output_dir,
+        request=LLMRunRequest(stage="diarized_asr_audit", auto=True),
+        fingerprint=fingerprint,
+        client_factory=client_factory,
+    )
+
+
 def run_llm_stage(
     output_dir: Path,
     *,
     request: LLMRunRequest | None = None,
     run_id: str | None = None,
+    fingerprint: str | None = None,
     client: LLMClientProtocol | None = None,
     client_factory: Callable[[LLMSettings], LLMClientProtocol] | None = None,
 ) -> dict[str, Any]:
@@ -200,6 +264,8 @@ def run_llm_stage(
                 output_dir=str(output_dir),
                 audit_dir=str(audit_dir),
                 started_at=started_at,
+                auto=request.auto,
+                fingerprint=fingerprint,
             )
 
     try:
@@ -210,26 +276,21 @@ def run_llm_stage(
             raise ValueError("profileId не совпадает с активным профилем стадии.")
 
         settings = _resolve_settings(profile, request)
+        if client is None and client_factory is None:
+            runtime_status = ensure_llm_runtime(settings)
+            _event(run_id, "runtime_ready", provider=settings.provider, status=runtime_status.get("status"))
         client = client or (client_factory(settings) if client_factory else OpenAICompatibleLLMClient(settings))
         _event(run_id, "model_resolved", model=settings.model, temperature=settings.temperature, timeoutSec=settings.timeout_sec)
         _write_json(audit_dir / "profile_snapshot.json", profile.model_dump(mode="json"))
         _write_json(audit_dir / "run_request.json", request.model_dump(mode="json"))
         _require_loaded_model(client, settings.model)
 
-        segments = _segments_from_bundle(bundle)
-        chunks = _segment_chunks(segments, profile.maxInputChars)
-        _write_json(audit_dir / "input.json", {"version": 1, "chunks": chunks})
+        chunks = _chunks_for_stage(output_dir, bundle, profile, request.stage)
+        _write_json(audit_dir / "input.json", {"version": 1, "stage": request.stage, "chunks": chunks})
 
-        validated_suggestions: list[dict[str, Any]] = []
+        validated_payloads: list[dict[str, Any]] = []
         chunk_hashes = []
-        for chunk_index, chunk_segments in enumerate(chunks, start=1):
-            input_payload = {
-                "version": 1,
-                "stage": request.stage,
-                "chunkIndex": chunk_index,
-                "chunkTotal": len(chunks),
-                "segments": chunk_segments,
-            }
+        for chunk_index, input_payload in enumerate(chunks, start=1):
             messages = render_messages(profile, input_payload, settings.model)
             prompt_digest = profile_hash(profile, messages)
             chunk_hashes.append(prompt_digest)
@@ -238,22 +299,17 @@ def run_llm_stage(
             _write_json(audit_dir / f"request_redacted_{suffix}.json", _redacted_request(client, messages))
             _event(run_id, "request_written", chunkIndex=chunk_index, chunkTotal=len(chunks), promptHash=prompt_digest)
 
-            completion = client.complete_json(messages)
+            completion = _complete_json_with_retries(client, messages, run_id, chunk_index, retry_count=2)
             _write_json(audit_dir / f"raw_response_{suffix}.json", completion.get("rawResponse", completion))
             _event(run_id, "response_received", chunkIndex=chunk_index)
 
-            validated = LLMCorrectionResponse.model_validate(completion.get("content"))
+            validated = _validate_stage_response(request.stage, completion.get("content"))
             validated_payload = validated.model_dump(mode="json")
             _write_json(audit_dir / f"validated_response_{suffix}.json", validated_payload)
-            _event(run_id, "validated", chunkIndex=chunk_index, correctionCount=len(validated.corrections))
-            validated_suggestions.extend(correction.model_dump(mode="json") for correction in validated.corrections)
+            _event(run_id, "validated", chunkIndex=chunk_index, itemCount=_validated_item_count(request.stage, validated_payload))
+            validated_payloads.append(validated_payload)
 
-        merge_result = merge_llm_corrections(
-            output_dir,
-            run_id,
-            validated_suggestions,
-            source=f"llm_{request.stage}",
-        )
+        merge_result = _merge_stage_payloads(output_dir, run_id, request.stage, validated_payloads)
         _event(
             run_id,
             "merged",
@@ -275,8 +331,10 @@ def run_llm_stage(
             "chunkCount": len(chunks),
             "addedCount": merge_result["addedCount"],
             "skippedCount": merge_result["skippedCount"],
+            "auto": request.auto,
+            "autoAuditFingerprint": fingerprint,
         }
-        _write_json(audit_dir / "validated_response.json", {"corrections": validated_suggestions})
+        _write_json(audit_dir / "validated_response.json", {"stage": request.stage, "responses": validated_payloads})
         _write_json(audit_dir / "metadata.json", metadata)
         with _lock:
             state = _runs.get(run_id)
@@ -288,8 +346,7 @@ def run_llm_stage(
         return {
             **metadata,
             "auditDir": str(audit_dir),
-            "addedCorrections": merge_result["addedCorrections"],
-            "skippedCorrections": merge_result["skippedCorrections"],
+            **_public_merge_result(merge_result),
         }
     except (LLMClientError, ValidationError, ValueError, KeyError) as exc:
         message = _error_message(exc)
@@ -311,6 +368,8 @@ def run_llm_stage(
                 "startedAt": started_at,
                 "finishedAt": _now(),
                 "error": message,
+                "auto": request.auto,
+                "autoAuditFingerprint": fingerprint,
             },
         )
         with _lock:
@@ -322,6 +381,150 @@ def run_llm_stage(
         raise LLMPostprocessError(message, run_id=run_id, audit_dir=audit_dir) from exc
 
 
+def _chunks_for_stage(output_dir: Path, bundle: dict[str, Any], profile: LLMProfile, stage: str) -> list[dict[str, Any]]:
+    if stage == "diarized_asr_audit":
+        return _audit_chunks(output_dir, bundle, profile)
+    segments = _segments_from_bundle(bundle)
+    chunks = _segment_chunks(segments, profile.maxInputChars)
+    return [
+        {
+            "version": 1,
+            "stage": stage,
+            "chunkIndex": chunk_index,
+            "chunkTotal": len(chunks),
+            "segments": chunk,
+        }
+        for chunk_index, chunk in enumerate(chunks, start=1)
+    ]
+
+
+def _validate_stage_response(stage: str, content: Any) -> BaseModel:
+    if stage == "diarized_asr_audit":
+        return LLMAuditResponse.model_validate(content)
+    return LLMCorrectionResponse.model_validate(content)
+
+
+def _validated_item_count(stage: str, payload: dict[str, Any]) -> int:
+    if stage == "diarized_asr_audit":
+        return (
+            len(payload.get("suggestions", []))
+            + len(payload.get("speakerMapSuggestions", []))
+            + len(payload.get("glossary", []))
+            + len(payload.get("technicalFlags", []))
+        )
+    return len(payload.get("corrections", []))
+
+
+def _merge_stage_payloads(output_dir: Path, run_id: str, stage: str, payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    if stage == "diarized_asr_audit":
+        aggregate = _empty_merge_result()
+        for payload in payloads:
+            _accumulate_merge_result(
+                aggregate,
+                merge_llm_audit_response(output_dir, run_id, payload, source=f"llm_{stage}"),
+            )
+        return aggregate
+
+    suggestions = []
+    for payload in payloads:
+        suggestions.extend(payload.get("corrections", []))
+    return merge_llm_corrections(output_dir, run_id, suggestions, source=f"llm_{stage}")
+
+
+def _empty_merge_result() -> dict[str, Any]:
+    return {
+        "addedCount": 0,
+        "skippedCount": 0,
+        "addedCorrections": [],
+        "addedAudioFlags": [],
+        "addedEntities": [],
+        "addedAuditSuggestions": [],
+        "addedTechnicalFlags": [],
+        "skippedSuggestions": [],
+    }
+
+
+def _accumulate_merge_result(target: dict[str, Any], source: dict[str, Any]) -> None:
+    target["addedCount"] += int(source.get("addedCount") or 0)
+    target["skippedCount"] += int(source.get("skippedCount") or 0)
+    for key in (
+        "addedCorrections",
+        "addedAudioFlags",
+        "addedEntities",
+        "addedAuditSuggestions",
+        "addedTechnicalFlags",
+        "skippedSuggestions",
+    ):
+        target.setdefault(key, []).extend(source.get(key, []))
+
+
+def _public_merge_result(merge_result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in merge_result.items()
+        if key.startswith("added") or key.startswith("skipped")
+    }
+
+
+def _complete_json_with_retries(
+    client: LLMClientProtocol,
+    messages: list[dict[str, str]],
+    run_id: str,
+    chunk_index: int,
+    retry_count: int,
+) -> dict[str, Any]:
+    last_error: LLMClientError | None = None
+    for attempt in range(retry_count + 1):
+        try:
+            return client.complete_json(messages)
+        except LLMClientError as exc:
+            last_error = exc
+            if attempt >= retry_count:
+                break
+            delay = 1.0 + attempt * 2.0
+            _event(run_id, "retry", chunkIndex=chunk_index, attempt=attempt + 1, delaySec=delay, error=str(exc))
+            time.sleep(delay)
+    raise last_error or LLMClientError("LLM call failed.")
+
+
+def _auto_audit_fingerprint(output_dir: Path) -> str:
+    profile = get_profile("diarized_asr_audit")
+    settings = LLMSettings.from_env()
+    payload = {
+        "segments": _file_sha256(output_dir / "segments.json"),
+        "words": _file_sha256(output_dir / "words.json"),
+        "profile": profile_hash(profile, []),
+        "model": settings.model,
+        "provider": settings.provider,
+        "llamaModelPath": settings.llama_model_path,
+    }
+    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    return sha256(path.read_bytes()).hexdigest()
+
+
+def _find_existing_auto_audit(output_dir: Path, fingerprint: str) -> dict[str, Any] | None:
+    runs_dir = _review_dir(output_dir) / "llm_runs"
+    if not runs_dir.exists():
+        return None
+    for metadata_path in runs_dir.glob("*/metadata.json"):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if (
+            isinstance(metadata, dict)
+            and metadata.get("stage") == "diarized_asr_audit"
+            and metadata.get("autoAuditFingerprint") == fingerprint
+            and metadata.get("status") in {"queued", "running", "done"}
+        ):
+            metadata.setdefault("auditDir", str(metadata_path.parent))
+            return metadata
+    return None
+
+
 def _resolve_settings(profile: LLMProfile, request: LLMRunRequest) -> LLMSettings:
     env_settings = LLMSettings.from_env()
     model = (request.model or profile.defaultModel or env_settings.model).strip()
@@ -331,6 +534,9 @@ def _resolve_settings(profile: LLMProfile, request: LLMRunRequest) -> LLMSetting
         temperature=request.temperature if request.temperature is not None else profile.temperature or env_settings.temperature,
         timeout_sec=request.timeoutSec if request.timeoutSec is not None else profile.timeoutSec or env_settings.timeout_sec,
         api_key=env_settings.api_key,
+        provider=env_settings.provider,
+        llama_server_exe=env_settings.llama_server_exe,
+        llama_model_path=env_settings.llama_model_path,
     )
 
 
@@ -340,7 +546,7 @@ def _require_loaded_model(client: LLMClientProtocol, model: str) -> None:
         return
     status = status_reader()
     if not status.get("reachable"):
-        raise LLMClientError(str(status.get("error") or "LM Studio недоступен."))
+        raise LLMClientError(str(status.get("error") or "LLM endpoint недоступен."))
     if not status.get("modelLoaded"):
         available = ", ".join(status.get("availableModels") or [])
         suffix = f" Доступно: {available}." if available else ""
@@ -404,6 +610,187 @@ def _segments_from_bundle(bundle: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return segments
+
+
+def _audit_chunks(output_dir: Path, bundle: dict[str, Any], profile: LLMProfile) -> list[dict[str, Any]]:
+    segments = _audit_segments_from_bundle(bundle)
+    metadata = _metadata_from_output(output_dir)
+    technical_signals = _technical_signals(metadata, segments, bundle)
+    speaker_turn_text = [
+        {
+            "speaker": turn.get("speaker"),
+            "text": turn.get("text"),
+        }
+        for turn in bundle.get("speakerTurns", {}).get("turns", [])
+        if isinstance(turn, dict)
+    ]
+    known_speakers = [
+        {
+            "speakerLabel": speaker.get("label"),
+            "role": "unknown",
+            "name": speaker.get("displayName") or "",
+            "confidence": 0.0 if not speaker.get("displayName") else 0.8,
+        }
+        for speaker in bundle.get("speakers", {}).get("speakers", [])
+        if isinstance(speaker, dict)
+    ]
+    chunk_size = profile.chunkSegmentCount
+    overlap = min(profile.chunkOverlap, max(0, chunk_size - 1))
+    chunks: list[dict[str, Any]] = []
+    total = max(1, (len(segments) + chunk_size - 1) // chunk_size)
+    for chunk_index, primary_start in enumerate(range(0, len(segments), chunk_size), start=1):
+        primary_end = min(len(segments), primary_start + chunk_size)
+        chunk_start = max(0, primary_start - overlap)
+        chunk_end = min(len(segments), primary_end + overlap)
+        chunk_segments = segments[chunk_start:chunk_end]
+        low_confidence_words = [
+            word
+            for segment in chunk_segments
+            for word in segment.get("words", [])
+            if isinstance(word, dict) and isinstance(word.get("score"), (int, float)) and word["score"] < 0.75
+        ]
+        chunks.append(
+            {
+                "task": "diarized_asr_audit",
+                "language": metadata.get("language") or "ru",
+                "chunkId": f"chunk_{chunk_index:04d}",
+                "chunkIndex": chunk_index,
+                "chunkTotal": total,
+                "chunkRange": {
+                    "start": chunk_segments[0].get("start") if chunk_segments else 0.0,
+                    "end": chunk_segments[-1].get("end") if chunk_segments else 0.0,
+                },
+                "primarySegmentIds": [segment["segmentId"] for segment in segments[primary_start:primary_end]],
+                "metadata": {
+                    "project": metadata.get("project") or "Ogurcast",
+                    "model": metadata.get("model"),
+                    "language": metadata.get("language"),
+                    "alignmentStatus": metadata.get("alignment_status"),
+                    "diarizationStatus": metadata.get("diarization_status"),
+                    "minSpeakers": metadata.get("min_speakers"),
+                    "maxSpeakers": metadata.get("max_speakers"),
+                },
+                "knownSpeakers": known_speakers,
+                "segments": chunk_segments,
+                "adjacentContext": {
+                    "previousSegments": segments[max(0, chunk_start - overlap):chunk_start],
+                    "nextSegments": segments[chunk_end:min(len(segments), chunk_end + overlap)],
+                },
+                "speakerTurnText": speaker_turn_text,
+                "lowConfidenceWords": low_confidence_words,
+                "sourceConflicts": [],
+                "entityEvidence": [],
+                "technicalSignals": technical_signals,
+            }
+        )
+    return chunks or [
+        {
+            "task": "diarized_asr_audit",
+            "language": metadata.get("language") or "ru",
+            "chunkId": "chunk_0001",
+            "chunkIndex": 1,
+            "chunkTotal": 1,
+            "chunkRange": {"start": 0.0, "end": 0.0},
+            "primarySegmentIds": [],
+            "metadata": metadata,
+            "knownSpeakers": known_speakers,
+            "segments": [],
+            "adjacentContext": {"previousSegments": [], "nextSegments": []},
+            "speakerTurnText": speaker_turn_text,
+            "lowConfidenceWords": [],
+            "sourceConflicts": [],
+            "entityEvidence": [],
+            "technicalSignals": technical_signals,
+        }
+    ]
+
+
+def _audit_segments_from_bundle(bundle: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_segments = [
+        segment
+        for segment in bundle.get("transcript", {}).get("segments", [])
+        if isinstance(segment, dict)
+    ]
+    audit_segments = []
+    for segment in raw_segments:
+        segment_id = str(segment.get("id"))
+        audit_segments.append(
+            {
+                "segmentId": segment_id,
+                "start": segment.get("start"),
+                "end": segment.get("end"),
+                "speaker": segment.get("speaker"),
+                "text": segment.get("text"),
+                "words": [
+                    {
+                        "wordId": word.get("id"),
+                        "word": word.get("word"),
+                        "start": word.get("start"),
+                        "end": word.get("end"),
+                        "score": word.get("score"),
+                        "speaker": word.get("speaker"),
+                        "segmentId": segment_id,
+                    }
+                    for word in segment.get("words", [])
+                    if isinstance(word, dict)
+                ],
+            }
+        )
+    return audit_segments
+
+
+def _metadata_from_output(output_dir: Path) -> dict[str, Any]:
+    path = output_dir / "metadata.json"
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
+def _technical_signals(metadata: dict[str, Any], segments: list[dict[str, Any]], bundle: dict[str, Any]) -> list[dict[str, Any]]:
+    signals: list[dict[str, Any]] = []
+    if metadata.get("alignment_status") != "done":
+        signals.append({"type": "alignment_not_done", "value": _text_or_none(metadata.get("alignment_status"))})
+    if metadata.get("diarization_status") != "done":
+        signals.append({"type": "diarization_not_done", "value": _text_or_none(metadata.get("diarization_status"))})
+    if not bundle.get("words"):
+        signals.append({"type": "missing_word_layer", "value": "words.json is empty"})
+    for segment in segments:
+        word_speakers = {
+            word.get("speaker")
+            for word in segment.get("words", [])
+            if isinstance(word, dict) and word.get("speaker")
+        }
+        if len(word_speakers) > 1:
+            signals.append(
+                {
+                    "type": "intrasegment_speaker_shift",
+                    "segmentId": segment.get("segmentId"),
+                    "value": ", ".join(sorted(str(item) for item in word_speakers)),
+                }
+            )
+        duration = _number(segment.get("end")) - _number(segment.get("start"))
+        if 0 < duration < 0.5:
+            signals.append(
+                {
+                    "type": "microsegment",
+                    "segmentId": segment.get("segmentId"),
+                    "value": f"{duration:.3f}",
+                }
+            )
+    return signals
+
+
+def _text_or_none(value: Any) -> str | None:
+    text = str(value) if value is not None else None
+    return text if text else None
+
+
+def _number(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _context_segment(segment: dict[str, Any] | None) -> dict[str, Any] | None:

@@ -55,6 +55,9 @@ models/align/**
 models/diarization/**
 !models/diarization/
 !models/diarization/.gitkeep
+models/llm/**
+!models/llm/
+!models/llm/.gitkeep
 
 # Common local artifacts
 *.log

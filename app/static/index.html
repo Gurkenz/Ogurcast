@@ -142,17 +142,19 @@
         <div class="workbench-bar">
           <div id="modeTabs" class="mode-tabs"></div>
           <div class="workbench-actions">
-            <button id="runQwenButton" type="button" class="secondary">LLM: найти правки</button>
+            <button id="runQwenButton" type="button" class="secondary">LLM: повторить аудит</button>
             <button id="applySafeButton" type="button">Применить безопасные ASR</button>
             <button id="rollbackLatestButton" type="button" class="secondary">Rollback batch</button>
           </div>
         </div>
 
+        <div id="llmAuditStatus" class="llm-audit-status" hidden></div>
+
         <details class="panel llm-dev-panel">
           <summary>LLM developer</summary>
           <div class="llm-grid">
             <section>
-              <h2>LM Studio</h2>
+              <h2>LLM provider</h2>
               <dl id="llmStatus" class="facts compact"></dl>
               <div class="three">
                 <label>

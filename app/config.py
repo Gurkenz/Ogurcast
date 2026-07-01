@@ -15,6 +15,7 @@ MODELS_DIR = PROJECT_ROOT / "models"
 ASR_MODELS_DIR = MODELS_DIR / "asr"
 ALIGN_MODELS_DIR = MODELS_DIR / "align"
 DIARIZATION_MODELS_DIR = MODELS_DIR / "diarization"
+LLM_MODELS_DIR = MODELS_DIR / "llm"
 TMP_DIR = PROJECT_ROOT / "tmp"
 CACHE_DIR = PROJECT_ROOT / ".cache"
 STATIC_DIR = PROJECT_ROOT / "app" / "static"
@@ -52,6 +53,7 @@ def ensure_project_dirs() -> None:
         ASR_MODELS_DIR,
         ALIGN_MODELS_DIR,
         DIARIZATION_MODELS_DIR,
+        LLM_MODELS_DIR,
         TMP_DIR,
         CACHE_DIR,
         CACHE_DIR / "huggingface",

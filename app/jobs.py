@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from app.llm_runs import start_auto_llm_audit
+from app.review_artifacts import add_technical_flag, ensure_review_artifacts
 from app.whisperx_runner import run_whisperx_job
 
 
@@ -152,6 +154,7 @@ def _run_job_thread(
             job.output_dir = result.get("output_dir")
             job.result = result
             job.progress.append("Готово.")
+        _after_successful_job(job_id, result)
     except Exception as exc:
         with _lock:
             job = _jobs[job_id]
@@ -163,3 +166,39 @@ def _run_job_thread(
         with _lock:
             if _active_job_id == job_id:
                 _active_job_id = None
+
+
+def _after_successful_job(job_id: str, result: dict[str, Any]) -> None:
+    output_dir_value = result.get("output_dir")
+    if not output_dir_value:
+        return
+    output_dir = Path(str(output_dir_value))
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    diarization_status = str(metadata.get("diarization_status") or "")
+    try:
+        ensure_review_artifacts(output_dir)
+        if diarization_status == "done":
+            run = start_auto_llm_audit(job_id=job_id, output_dir=output_dir)
+            _append_auto_audit_progress(job_id, run)
+        else:
+            add_technical_flag(
+                output_dir,
+                flag="diarization_not_done",
+                severity="high" if diarization_status == "failed" else "medium",
+                risk="high",
+                reason=f"LLM audit не запущен: diarization_status={diarization_status or 'unknown'}.",
+                recommended_action="Проверить HF_TOKEN/pyannote и повторить диаризацию перед автоматическим LLM audit.",
+            )
+            append_progress(job_id, "LLM audit пропущен: диаризация не завершена.")
+    except Exception as exc:
+        append_progress(job_id, f"LLM audit не запущен: {exc}")
+
+
+def _append_auto_audit_progress(job_id: str, run: dict[str, Any]) -> None:
+    status = str(run.get("status") or "")
+    if status == "deduplicated":
+        append_progress(job_id, "LLM audit уже есть для этих артефактов.")
+    elif status == "disabled":
+        append_progress(job_id, "LLM audit отключен настройкой OGURCAST_LLM_AUTO_AUDIT.")
+    else:
+        append_progress(job_id, "LLM audit поставлен в очередь.")

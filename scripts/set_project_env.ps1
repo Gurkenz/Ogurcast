@@ -31,6 +31,7 @@ New-Item -ItemType Directory -Force -Path `
   "$ProjectRoot\models\asr", `
   "$ProjectRoot\models\align", `
   "$ProjectRoot\models\diarization", `
+  "$ProjectRoot\models\llm", `
   "$ProjectRoot\tools" | Out-Null
 
 $ffmpegCommand = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue

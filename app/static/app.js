@@ -11,6 +11,7 @@ const dropZone = document.getElementById("dropZone");
 const workbenchView = document.getElementById("workbenchView");
 const modeTabs = document.getElementById("modeTabs");
 const runQwenButton = document.getElementById("runQwenButton");
+const llmAuditStatus = document.getElementById("llmAuditStatus");
 const applySafeButton = document.getElementById("applySafeButton");
 const rollbackLatestButton = document.getElementById("rollbackLatestButton");
 const segmentRail = document.getElementById("segmentRail");
@@ -41,6 +42,9 @@ const state = {
   corrections: [],
   audioFlags: [],
   entities: [],
+  auditSuggestions: [],
+  technicalFlags: [],
+  llmAuditState: { status: "not_started" },
   speakers: [],
   speakerTurns: [],
   segmentById: new Map(),
@@ -180,14 +184,21 @@ function renderLlmStatus(data) {
   llmStatus.replaceChildren();
   const availableModels = data.availableModels || [];
   state.availableModels = availableModels;
-  state.llmReady = Boolean(data.reachable && data.modelLoaded && availableModels.length);
+  state.llmReady = Boolean((data.reachable && data.modelLoaded && availableModels.length) || data.provider === "llamacpp");
   const rows = [
+    ["Provider", data.provider || ""],
     ["Base URL", data.baseUrl || ""],
     ["Reachable", boolText(data.reachable)],
     ["Configured", data.configuredModel || ""],
     ["Loaded", boolText(data.modelLoaded)],
     ["Available", (data.availableModels || []).join(", ") || "нет"],
   ];
+  if (data.llamaServerExe) {
+    rows.push(["llama-server", data.llamaServerExe]);
+  }
+  if (data.llamaModelPath) {
+    rows.push(["GGUF", data.llamaModelPath]);
+  }
   if (data.error) {
     rows.push(["Ошибка", data.error]);
   }
@@ -236,7 +247,7 @@ async function loadLlmDeveloperData() {
       requestJson("/api/llm/profiles"),
     ]);
     renderLlmStatus(status);
-    const profile = profiles.effective?.asr_correction || profiles.defaults?.asr_correction;
+    const profile = profiles.effective?.diarized_asr_audit || profiles.defaults?.diarized_asr_audit;
     fillLlmProfile(profile);
   } catch (error) {
     llmStatus.replaceChildren(el("dt", "", "Ошибка"), el("dd", "", error.message));
@@ -245,9 +256,9 @@ async function loadLlmDeveloperData() {
 
 function collectLlmProfilePayload() {
   return {
-    profileId: state.llmProfile?.profileId || "local-asr-correction",
+    profileId: state.llmProfile?.profileId || "local-diarized-asr-audit",
     version: Number(state.llmProfile?.version || 1),
-    label: state.llmProfile?.label || "ASR correction",
+    label: state.llmProfile?.label || "Diarized ASR audit",
     stageDescription: llmStageDescription.value.trim(),
     systemInstruction: llmSystemInstruction.value.trim(),
     userPayloadTemplate: llmUserTemplate.value.trim(),
@@ -452,6 +463,9 @@ function loadReviewState(data) {
   state.corrections = data.corrections?.corrections || [];
   state.audioFlags = data.audioFlags?.flags || [];
   state.entities = data.entities?.entities || [];
+  state.auditSuggestions = data.auditSuggestions?.suggestions || [];
+  state.technicalFlags = data.technicalFlags?.flags || [];
+  state.llmAuditState = data.llmAuditState || { status: "not_started" };
   state.speakers = data.speakers?.speakers || [];
   state.speakerTurns = data.speakerTurns?.turns || [];
   state.segmentById = new Map(state.transcript.map((segment) => [segment.id, segment]));
@@ -525,6 +539,7 @@ function entitiesForSegment(segmentId) {
 
 function renderWorkbench() {
   rebuildApprovedMap();
+  renderLlmAuditStatus();
   renderModeTabs();
   renderSegmentRail();
   renderEditor();
@@ -534,7 +549,42 @@ function renderWorkbench() {
   applySafeButton.textContent = `Применить безопасные ASR (${safeCount})`;
   applySafeButton.disabled = safeCount === 0;
   rollbackLatestButton.disabled = state.appliedBatches.length === 0;
+  runQwenButton.textContent = "LLM: повторить аудит";
   runQwenButton.disabled = !state.currentJobId || !state.llmReady;
+}
+
+function renderLlmAuditStatus() {
+  const audit = state.llmAuditState || { status: "not_started" };
+  const status = audit.status || "not_started";
+  const added = Number(audit.addedCount || 0);
+  const skipped = Number(audit.skippedCount || 0);
+  llmAuditStatus.hidden = false;
+  llmAuditStatus.className = `llm-audit-status ${status}`;
+  const path = audit.auditDir ? ` · ${audit.auditDir}` : "";
+  if (status === "done") {
+    llmAuditStatus.textContent = `LLM audit: done · added ${added}, skipped ${skipped}${path}`;
+  } else if (status === "failed") {
+    llmAuditStatus.textContent = `LLM audit: failed · ${audit.error || "ошибка модели"}${path}`;
+  } else if (status === "running" || status === "queued") {
+    llmAuditStatus.textContent = `LLM audit: ${status}${path}`;
+  } else {
+    llmAuditStatus.textContent = "LLM audit: not started";
+  }
+}
+
+function llmAuditWarningText() {
+  const audit = state.llmAuditState || { status: "not_started" };
+  const status = audit.status || "not_started";
+  if (status === "failed") {
+    return `LLM audit упал: ${audit.error || "ошибка модели"}. Пустая ASR queue не означает чистый текст.`;
+  }
+  if (status === "queued" || status === "running") {
+    return "LLM audit еще выполняется. Пустая ASR queue пока не означает чистый текст.";
+  }
+  if (status === "not_started") {
+    return "LLM audit еще не запускался. Пустая ASR queue не означает чистый текст.";
+  }
+  return "";
 }
 
 function renderModeTabs() {
@@ -820,6 +870,10 @@ function renderEditor() {
   if (state.mode === "asr") {
     editorTitle.textContent = "ASR Review";
     editorStats.textContent = `Safe fixes: ${safeCount} · Needs review: ${pendingCorrections - safeCount}`;
+    const warning = llmAuditWarningText();
+    if (warning && pendingCorrections === 0) {
+      transcriptEditor.append(el("div", "review-warning", warning));
+    }
     for (const segment of state.transcript) {
       transcriptEditor.append(renderAsrSegment(segment));
     }
@@ -882,7 +936,12 @@ function queueItem(primary, secondary, onClick, tone = "") {
 function renderTextQueue() {
   queueTitle.textContent = "Очередь проверки";
   const pending = state.corrections.filter((correction) => correction.status === "pending").length;
+  const auditStatus = state.llmAuditState?.status || "not_started";
   reviewQueue.append(
+    queueItem("LLM audit", auditStatus, () => {
+      state.mode = "asr";
+      renderWorkbench();
+    }, auditStatus === "failed" ? "bad-item" : auditStatus === "done" ? "" : "warn-item"),
     queueItem("ASR", `${pending} ожидает`, () => {
       state.mode = "asr";
       renderWorkbench();
@@ -897,6 +956,10 @@ function renderTextQueue() {
     }),
     queueItem("Спикеры", `${state.speakers.length} профилей`, () => {
       state.mode = "speaker";
+      renderWorkbench();
+    }),
+    queueItem("Технические флаги", `${state.technicalFlags.filter((flag) => flag.status !== "ignored").length} активных`, () => {
+      state.mode = "listen";
       renderWorkbench();
     }),
   );
@@ -966,6 +1029,14 @@ function renderListenQueue() {
         playRange(flag.startTime, flag.endTime);
       },
       "warn-item",
+    ));
+  }
+  for (const flag of state.technicalFlags.filter((item) => item.status !== "ignored")) {
+    reviewQueue.append(queueItem(
+      `TECH · ${flag.severity || "medium"}`,
+      `${flag.flag || "technical_flag"} · ${truncate(flag.reason || "", 42)}`,
+      null,
+      flag.severity === "critical" || flag.severity === "high" ? "bad-item" : "warn-item",
     ));
   }
 }
@@ -1126,7 +1197,7 @@ saveLlmProfileButton.addEventListener("click", async () => {
   setError("");
   saveLlmProfileButton.disabled = true;
   try {
-    const data = await sendJson("/api/llm/profiles/asr_correction", "PUT", collectLlmProfilePayload());
+    const data = await sendJson("/api/llm/profiles/diarized_asr_audit", "PUT", collectLlmProfilePayload());
     fillLlmProfile(data.profile);
     await loadLlmDeveloperData();
     appendProgressLine("LLM profile сохранен.");
@@ -1147,14 +1218,14 @@ async function pollLlmRun(runId) {
     state.mode = "asr";
     renderWorkbench();
     const summary = run.summary || {};
-    appendProgressLine(`LLM: добавлено ${summary.addedCount || 0}, пропущено ${summary.skippedCount || 0}.`);
-    runQwenButton.textContent = "LLM: найти правки";
+    appendProgressLine(`LLM audit: добавлено ${summary.addedCount || 0}, пропущено ${summary.skippedCount || 0}.`);
+    runQwenButton.textContent = "LLM: повторить аудит";
     runQwenButton.disabled = !state.currentJobId;
   } else if (run.status === "failed") {
     clearInterval(state.llmRunPollTimer);
     state.llmRunPollTimer = null;
     setError(run.error || "Ошибка LLM run.");
-    runQwenButton.textContent = "LLM: найти правки";
+    runQwenButton.textContent = "LLM: повторить аудит";
     runQwenButton.disabled = !state.currentJobId;
   }
 }
@@ -1166,14 +1237,14 @@ runQwenButton.addEventListener("click", async () => {
   }
   setError("");
   runQwenButton.disabled = true;
-  runQwenButton.textContent = "LLM: обработка...";
+  runQwenButton.textContent = "LLM: аудит...";
   try {
     const payload = {
-      stage: "asr_correction",
+      stage: "diarized_asr_audit",
       model: llmModel.value.trim(),
       temperature: Number(llmTemperature.value),
       timeoutSec: Number(llmTimeout.value),
-      profileId: state.llmProfile?.profileId || "default-asr-correction",
+      profileId: state.llmProfile?.profileId || "default-diarized-asr-audit",
     };
     const run = await sendJson(`/api/jobs/${state.currentJobId}/llm/runs`, "POST", payload);
     renderLlmEvents(run);
@@ -1182,14 +1253,14 @@ runQwenButton.addEventListener("click", async () => {
         clearInterval(state.llmRunPollTimer);
         state.llmRunPollTimer = null;
         setError(error.message);
-        runQwenButton.textContent = "LLM: найти правки";
+        runQwenButton.textContent = "LLM: повторить аудит";
         runQwenButton.disabled = !state.currentJobId;
       });
     }, 1000);
     await pollLlmRun(run.run_id);
   } catch (error) {
     setError(error.message);
-    runQwenButton.textContent = "LLM: найти правки";
+    runQwenButton.textContent = "LLM: повторить аудит";
     runQwenButton.disabled = !state.currentJobId;
   }
 });

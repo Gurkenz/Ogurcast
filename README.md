@@ -72,25 +72,38 @@ Z:\Ogurcast\logs\warmup.log
 http://127.0.0.1:7860
 ```
 
-## Qwen3 postprocessing
+## LLM audit
 
-Первый LLM-этап работает через LM Studio OpenAI-compatible API. Qwen3 не скачивается и не запускается приложением: модель должна быть уже загружена в LM Studio.
+Основной LLM-этап `diarized_asr_audit` работает через repo-managed `llama-server` OpenAI-compatible API. Приложение не скачивает multi-GB модели во время транскрибации: `llama-server.exe` должен лежать в `Z:\Ogurcast\tools`, а GGUF-модель в `Z:\Ogurcast\models\llm`.
 
 Defaults:
 
 ```text
-OGURCAST_LLM_BASE_URL=http://127.0.0.1:1234/v1
-OGURCAST_LLM_MODEL=qwen3-8b
-OGURCAST_LLM_TEMPERATURE=0.15
-OGURCAST_LLM_TIMEOUT_SEC=120
+OGURCAST_LLM_PROVIDER=llamacpp
+OGURCAST_LLM_BASE_URL=http://127.0.0.1:8080/v1
+OGURCAST_LLM_MODEL=qwen3-8b-q4_k_m.gguf
+OGURCAST_LLM_TEMPERATURE=0.05
+OGURCAST_LLM_TIMEOUT_SEC=180
 OGURCAST_LLM_API_KEY=
+OGURCAST_LLAMA_SERVER_EXE=Z:\Ogurcast\tools\llama-server.exe
+OGURCAST_LLAMA_MODEL_PATH=Z:\Ogurcast\models\llm\qwen3-8b-q4_k_m.gguf
+OGURCAST_LLM_AUTO_AUDIT=true
 ```
 
-В Workbench кнопка `LLM: найти правки` запускает stage `asr_correction` через `POST /api/jobs/{job_id}/llm/runs`. Модель возвращает только структурированные correction suggestions. Применение правок остается ручным через Review Workbench или через безопасный batch для low-risk ASR corrections.
+После успешной diarization backend автоматически ставит `diarized_asr_audit` в очередь. Если `llama-server` еще не поднят, приложение пытается запустить `tools\llama-server.exe` с моделью из `OGURCAST_LLAMA_MODEL_PATH`, проверяет `/health` и `/v1/models`, затем вызывает `/v1/chat/completions`. Если LLM audit падает, WhisperX job остается `done`, а Workbench показывает failed audit status и audit dir.
+
+В Workbench кнопка `LLM: повторить аудит` запускает ручной rerun stage `diarized_asr_audit` через `POST /api/jobs/{job_id}/llm/runs`. Модель возвращает только structured audit findings. Сервер проецирует их в review-layer artifacts:
+
+- text-safe findings -> `review\correction_suggestions.json`;
+- uncertain/audio findings -> `review\audio_flags.json`;
+- glossary/entity findings -> `review\entity_annotations.json`;
+- diarization/source/technical findings -> `review\audit_suggestions.json` и `review\technical_flags.json`.
+
+Применение текста остается ручным через Review Workbench или через безопасный batch для low-risk ASR corrections.
 
 Developer panel показывает:
 
-- LM Studio base URL, configured model, доступные модели и loaded-state;
+- LLM provider, base URL, configured model, доступные модели и loaded-state;
 - per-run model/temperature/timeout;
 - редактируемый `system instruction`, `user payload template`, описание стадии и schema notes.
 
@@ -113,12 +126,14 @@ LLM status API:
 ```text
 GET /api/llm/status
 GET /api/llm/profiles
-PUT /api/llm/profiles/asr_correction
+PUT /api/llm/profiles/diarized_asr_audit
 POST /api/jobs/{job_id}/llm/runs
 GET /api/jobs/{job_id}/llm/runs/{run_id}
 ```
 
-Важно: доступность HTTP endpoint LM Studio не равна готовности модели. `GET /api/llm/status` должен показывать нужную модель в `availableModels` и `modelLoaded=true`. Если LM Studio отдает модель под другим именем, обновите `OGURCAST_LLM_MODEL` в `.env` или выберите фактическое имя модели в developer panel для конкретного запуска.
+Важно: доступность HTTP endpoint не равна готовности модели. `GET /api/llm/status` должен показывать loaded model evidence: `availableModels` и `modelLoaded=true`. Для `llamacpp` один загруженный model id считается достаточным loaded-state; для LM Studio лучше выставить точный `OGURCAST_LLM_MODEL`.
+
+LM Studio остается fallback: задайте `OGURCAST_LLM_PROVIDER=lmstudio`, `OGURCAST_LLM_BASE_URL=http://127.0.0.1:1234/v1` и фактический model id из `/v1/models`.
 
 User-facing correction queue не содержит фоновые нормализации пробелов и no-op правки. Нормализация whitespace применяется при создании review transcript. Низкая уверенность ASR сохраняется отдельно как audio flags, а не как фиктивная правка вида `слово -> слово`.
 

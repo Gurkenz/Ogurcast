@@ -14,8 +14,19 @@ from app.file_utils import ensure_inside_project
 REVIEW_DIR_NAME = "review"
 SAFE_BATCH_CATEGORIES = {"ASR_ERROR", "TYPO", "PUNCTUATION"}
 TEXT_CHANGE_CATEGORIES = {"ASR_ERROR", "TYPO", "PUNCTUATION", "FILLER_GARBAGE"}
+AUDIT_TEXT_CHANGE_CATEGORIES = {"ASR_OBVIOUS", "ASR_PUNCTUATION"}
+AUDIO_REVIEW_AUDIT_CATEGORIES = {"ASR_ENTITY_UNCERTAIN", "ASR_LOW_CONFIDENCE", "AUDIO_REVIEW", "ASR_LOOP"}
+DIARIZATION_AUDIT_CATEGORIES = {
+    "DIARIZATION_WRONG_SPEAKER",
+    "DIARIZATION_BOUNDARY",
+    "DIARIZATION_INTRASEGMENT_SHIFT",
+    "DIARIZATION_EMBEDDED_REPLY",
+    "DIARIZATION_MICROSEGMENT",
+}
+REVIEW_AUDIT_CATEGORIES = DIARIZATION_AUDIT_CATEGORIES | {"SERVICE_FRAGMENT", "SOURCE_CONFLICT", "TECHNICAL_FLAG"}
 CORRECTION_STATUSES = {"pending", "accepted", "rejected", "modified"}
 LLM_SOURCE = "llm_asr_correction"
+AUDIT_SOURCE = "llm_diarized_asr_audit"
 AUDIO_FLAG_STATUSES = {"pending", "resolved", "ignored"}
 ENTITY_STATUSES = {"pending", "accepted", "rejected", "modified"}
 ENTITY_VERIFICATION_STATUSES = {
@@ -100,10 +111,15 @@ def _correction_key(correction: dict[str, Any]) -> tuple[str, str, str, str]:
 
 
 def _next_correction_index(corrections: list[dict[str, Any]]) -> int:
+    return _next_prefixed_index(corrections, "corr")
+
+
+def _next_prefixed_index(items: list[dict[str, Any]], prefix: str) -> int:
     max_index = 0
-    for correction in corrections:
-        raw_id = _text(correction.get("id"))
-        match = re.fullmatch(r"corr-(\d+)", raw_id)
+    pattern = re.compile(rf"{re.escape(prefix)}-(\d+)")
+    for item in items:
+        raw_id = _text(item.get("id"))
+        match = pattern.fullmatch(raw_id)
         if match:
             max_index = max(max_index, int(match.group(1)))
     return max_index + 1
@@ -370,6 +386,8 @@ def _migrate_review_artifacts(output_dir: Path) -> None:
     approved_path = review_dir / "approved_transcript.json"
     flags_path = review_dir / "audio_flags.json"
     speakers_path = review_dir / "speaker_profiles.json"
+    audit_path = review_dir / "audit_suggestions.json"
+    technical_path = review_dir / "technical_flags.json"
 
     transcript = _read_json(transcript_path)
     segments = transcript.get("segments", [])
@@ -428,6 +446,10 @@ def _migrate_review_artifacts(output_dir: Path) -> None:
     flags = _generate_audio_flags([segment for segment in segments if isinstance(segment, dict)])
     if not flags_path.exists():
         _write_json(flags_path, {"version": 1, "updatedAt": _now(), "flags": flags})
+    if not audit_path.exists():
+        _write_json(audit_path, {"version": 1, "updatedAt": _now(), "suggestions": []})
+    if not technical_path.exists():
+        _write_json(technical_path, {"version": 1, "updatedAt": _now(), "flags": []})
 
     speakers_data = _read_json(speakers_path)
     speakers = speakers_data.get("speakers", [])
@@ -463,6 +485,8 @@ def ensure_review_artifacts(output_dir: Path) -> dict[str, Any]:
     flags_path = review_dir / "audio_flags.json"
     entities_path = review_dir / "entity_annotations.json"
     speakers_path = review_dir / "speaker_profiles.json"
+    audit_path = review_dir / "audit_suggestions.json"
+    technical_path = review_dir / "technical_flags.json"
     batches_path = review_dir / "edit_batches.json"
     approved_path = review_dir / "approved_transcript.json"
     state_path = review_dir / "review_state.json"
@@ -481,6 +505,10 @@ def ensure_review_artifacts(output_dir: Path) -> dict[str, Any]:
         _write_json(entities_path, {"version": 1, "updatedAt": created_at, "entities": _generate_entities(segments)})
     if not speakers_path.exists():
         _write_json(speakers_path, {"version": 1, "updatedAt": created_at, "speakers": _generate_speakers(segments)})
+    if not audit_path.exists():
+        _write_json(audit_path, {"version": 1, "updatedAt": created_at, "suggestions": []})
+    if not technical_path.exists():
+        _write_json(technical_path, {"version": 1, "updatedAt": created_at, "flags": []})
     if not batches_path.exists():
         _write_json(batches_path, {"version": 1, "updatedAt": created_at, "batches": []})
     if not approved_path.exists():
@@ -509,6 +537,8 @@ def review_artifact_paths(output_dir: Path) -> dict[str, str]:
         "audio_flags.json",
         "entity_annotations.json",
         "speaker_profiles.json",
+        "audit_suggestions.json",
+        "technical_flags.json",
         "edit_batches.json",
         "approved_transcript.json",
         "review_state.json",
@@ -516,6 +546,36 @@ def review_artifact_paths(output_dir: Path) -> dict[str, str]:
     paths = {name: str(review_dir / name) for name in names}
     paths["llm_runs"] = str(review_dir / "llm_runs")
     return paths
+
+
+def _latest_llm_audit_state(review_dir: Path) -> dict[str, Any]:
+    runs_dir = review_dir / "llm_runs"
+    if not runs_dir.exists():
+        return {"status": "not_started", "stage": "diarized_asr_audit"}
+
+    candidates: list[dict[str, Any]] = []
+    for metadata_path in runs_dir.glob("*/metadata.json"):
+        try:
+            metadata = _read_json(metadata_path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(metadata, dict) or metadata.get("stage") != "diarized_asr_audit":
+            continue
+        audit_dir = metadata_path.parent
+        metadata = dict(metadata)
+        metadata.setdefault("auditDir", str(audit_dir))
+        metadata["_sortKey"] = (
+            _text(metadata.get("finishedAt"))
+            or _text(metadata.get("startedAt"))
+            or _text(metadata.get("createdAt"))
+            or metadata_path.parent.name
+        )
+        candidates.append(metadata)
+    if not candidates:
+        return {"status": "not_started", "stage": "diarized_asr_audit"}
+    latest = max(candidates, key=lambda item: _text(item.get("_sortKey")))
+    latest.pop("_sortKey", None)
+    return latest
 
 
 def get_review_bundle(output_dir: Path) -> dict[str, Any]:
@@ -531,6 +591,8 @@ def get_review_bundle(output_dir: Path) -> dict[str, Any]:
         "corrections": _read_json(review_dir / "correction_suggestions.json"),
         "audioFlags": _read_json(review_dir / "audio_flags.json"),
         "entities": _read_json(review_dir / "entity_annotations.json"),
+        "auditSuggestions": _read_json(review_dir / "audit_suggestions.json"),
+        "technicalFlags": _read_json(review_dir / "technical_flags.json"),
         "speakers": speakers,
         "speakerTurns": {
             "version": 1,
@@ -538,6 +600,7 @@ def get_review_bundle(output_dir: Path) -> dict[str, Any]:
         },
         "editBatches": _read_json(review_dir / "edit_batches.json"),
         "reviewState": _read_json(review_dir / "review_state.json"),
+        "llmAuditState": _latest_llm_audit_state(review_dir),
     }
 
 
@@ -637,6 +700,532 @@ def merge_llm_corrections(
         "addedCorrections": added,
         "skippedCorrections": skipped,
     }
+
+
+def merge_llm_audit_response(
+    output_dir: Path,
+    run_id: str,
+    response: dict[str, Any],
+    source: str = AUDIT_SOURCE,
+) -> dict[str, Any]:
+    ensure_review_artifacts(output_dir)
+    review_dir = _review_dir(Path(output_dir))
+    transcript = _read_json(review_dir / "transcript_normalized.json")
+    segments = {
+        segment["id"]: segment
+        for segment in transcript.get("segments", [])
+        if isinstance(segment, dict) and segment.get("id")
+    }
+
+    corrections_data = _read_json(review_dir / "correction_suggestions.json")
+    audio_data = _read_json(review_dir / "audio_flags.json")
+    entities_data = _read_json(review_dir / "entity_annotations.json")
+    audit_data = _read_json(review_dir / "audit_suggestions.json")
+    technical_data = _read_json(review_dir / "technical_flags.json")
+
+    corrections = corrections_data.setdefault("corrections", [])
+    audio_flags = audio_data.setdefault("flags", [])
+    entities = entities_data.setdefault("entities", [])
+    audit_suggestions = audit_data.setdefault("suggestions", [])
+    technical_flags = technical_data.setdefault("flags", [])
+    if not all(isinstance(collection, list) for collection in (corrections, audio_flags, entities, audit_suggestions, technical_flags)):
+        raise ValueError("review artifacts повреждены.")
+
+    existing_correction_keys = {_correction_key(item) for item in corrections if isinstance(item, dict)}
+    existing_audio_keys = {_audio_flag_key(item) for item in audio_flags if isinstance(item, dict)}
+    existing_entity_keys = {_entity_key(_text(item.get("surface"))) for item in entities if isinstance(item, dict)}
+    existing_audit_keys = {_audit_suggestion_key(item) for item in audit_suggestions if isinstance(item, dict)}
+    existing_technical_keys = {_technical_flag_key(item) for item in technical_flags if isinstance(item, dict)}
+
+    next_correction = _next_prefixed_index([item for item in corrections if isinstance(item, dict)], "corr")
+    next_audio = _next_prefixed_index([item for item in audio_flags if isinstance(item, dict)], "flag")
+    next_entity = _next_prefixed_index([item for item in entities if isinstance(item, dict)], "ent")
+    next_audit = _next_prefixed_index([item for item in audit_suggestions if isinstance(item, dict)], "audit")
+    next_technical = _next_prefixed_index([item for item in technical_flags if isinstance(item, dict)], "tech")
+
+    added_corrections: list[dict[str, Any]] = []
+    added_audio_flags: list[dict[str, Any]] = []
+    added_entities: list[dict[str, Any]] = []
+    added_audit_suggestions: list[dict[str, Any]] = []
+    added_technical_flags: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    for suggestion in response.get("suggestions", []):
+        if not isinstance(suggestion, dict):
+            skipped.append({"reason": "invalid_suggestion"})
+            continue
+        segment_id = _text(suggestion.get("segmentId"))
+        segment = segments.get(segment_id)
+        if segment is None:
+            skipped.append({"segmentId": segment_id, "reason": "segment_not_found"})
+            continue
+        involved = [
+            _text(item)
+            for item in suggestion.get("involvedSegmentIds", [])
+            if _text(item)
+        ]
+        missing_involved = [item for item in involved if item not in segments]
+        if missing_involved:
+            skipped.append({"segmentId": segment_id, "reason": "involved_segment_not_found", "missing": missing_involved})
+            continue
+
+        category = _text(suggestion.get("category"))
+        if _is_projectable_text_audit(suggestion):
+            correction = _audit_suggestion_to_correction(
+                suggestion,
+                segment,
+                next_correction,
+                run_id,
+                source,
+            )
+            if correction is None:
+                skipped.append({"segmentId": segment_id, "reason": "invalid_text_correction"})
+            else:
+                key = _correction_key(correction)
+                if key in existing_correction_keys:
+                    skipped.append({"segmentId": segment_id, "reason": "duplicate_correction"})
+                else:
+                    corrections.append(correction)
+                    added_corrections.append(correction)
+                    existing_correction_keys.add(key)
+                    next_correction += 1
+            continue
+
+        if _is_audio_audit_candidate(suggestion):
+            audio_flag = _audit_suggestion_to_audio_flag(suggestion, segment, next_audio, run_id, source)
+            key = _audio_flag_key(audio_flag)
+            if key in existing_audio_keys:
+                skipped.append({"segmentId": segment_id, "reason": "duplicate_audio_flag"})
+            else:
+                audio_flags.append(audio_flag)
+                added_audio_flags.append(audio_flag)
+                existing_audio_keys.add(key)
+                next_audio += 1
+
+        if category in REVIEW_AUDIT_CATEGORIES or category == "GLOSSARY_ENTITY":
+            audit_item = _audit_suggestion_to_review_item(suggestion, segment, next_audit, run_id, source)
+            key = _audit_suggestion_key(audit_item)
+            if key in existing_audit_keys:
+                skipped.append({"segmentId": segment_id, "reason": "duplicate_audit_suggestion"})
+            else:
+                audit_suggestions.append(audit_item)
+                added_audit_suggestions.append(audit_item)
+                existing_audit_keys.add(key)
+                next_audit += 1
+
+        if category == "TECHNICAL_FLAG":
+            technical_item = _technical_flag_from_suggestion(suggestion, next_technical, run_id, source)
+            key = _technical_flag_key(technical_item)
+            if key not in existing_technical_keys:
+                technical_flags.append(technical_item)
+                added_technical_flags.append(technical_item)
+                existing_technical_keys.add(key)
+                next_technical += 1
+
+    segment_ids_by_speaker = _segment_ids_by_speaker(segments)
+    for speaker_suggestion in response.get("speakerMapSuggestions", []):
+        if not isinstance(speaker_suggestion, dict):
+            skipped.append({"reason": "invalid_speaker_map_suggestion"})
+            continue
+        audit_item = _speaker_map_to_review_item(speaker_suggestion, segment_ids_by_speaker, next_audit, run_id, source)
+        if audit_item is None:
+            skipped.append({"reason": "speaker_not_found", "speakerLabel": speaker_suggestion.get("speakerLabel")})
+            continue
+        key = _audit_suggestion_key(audit_item)
+        if key in existing_audit_keys:
+            skipped.append({"reason": "duplicate_speaker_map_suggestion", "speakerLabel": speaker_suggestion.get("speakerLabel")})
+            continue
+        audit_suggestions.append(audit_item)
+        added_audit_suggestions.append(audit_item)
+        existing_audit_keys.add(key)
+        next_audit += 1
+
+    segment_ids_by_term = _glossary_segment_ids(response.get("suggestions", []), segments)
+    for glossary_item in response.get("glossary", []):
+        if not isinstance(glossary_item, dict):
+            skipped.append({"reason": "invalid_glossary_item"})
+            continue
+        entity = _glossary_to_entity(glossary_item, segment_ids_by_term, next_entity, run_id, source)
+        key = _entity_key(_text(entity.get("surface")))
+        if not key:
+            skipped.append({"reason": "empty_glossary_term"})
+            continue
+        if key in existing_entity_keys:
+            skipped.append({"reason": "duplicate_entity", "surface": entity.get("surface")})
+            continue
+        entities.append(entity)
+        added_entities.append(entity)
+        existing_entity_keys.add(key)
+        next_entity += 1
+
+    for flag in response.get("technicalFlags", []):
+        if not isinstance(flag, dict):
+            skipped.append({"reason": "invalid_technical_flag"})
+            continue
+        technical_item = _technical_flag_from_payload(flag, next_technical, run_id, source)
+        key = _technical_flag_key(technical_item)
+        if key in existing_technical_keys:
+            skipped.append({"reason": "duplicate_technical_flag", "flag": technical_item.get("flag")})
+            continue
+        technical_flags.append(technical_item)
+        added_technical_flags.append(technical_item)
+        existing_technical_keys.add(key)
+        next_technical += 1
+
+    now = _now()
+    if added_corrections:
+        corrections_data["updatedAt"] = now
+        _write_json(review_dir / "correction_suggestions.json", corrections_data)
+    if added_audio_flags:
+        audio_data["updatedAt"] = now
+        _write_json(review_dir / "audio_flags.json", audio_data)
+    if added_entities:
+        entities_data["updatedAt"] = now
+        _write_json(review_dir / "entity_annotations.json", entities_data)
+    if added_audit_suggestions:
+        audit_data["updatedAt"] = now
+        _write_json(review_dir / "audit_suggestions.json", audit_data)
+    if added_technical_flags:
+        technical_data["updatedAt"] = now
+        _write_json(review_dir / "technical_flags.json", technical_data)
+
+    added_count = (
+        len(added_corrections)
+        + len(added_audio_flags)
+        + len(added_entities)
+        + len(added_audit_suggestions)
+        + len(added_technical_flags)
+    )
+    return {
+        "addedCount": added_count,
+        "skippedCount": len(skipped),
+        "addedCorrections": added_corrections,
+        "addedAudioFlags": added_audio_flags,
+        "addedEntities": added_entities,
+        "addedAuditSuggestions": added_audit_suggestions,
+        "addedTechnicalFlags": added_technical_flags,
+        "skippedSuggestions": skipped,
+    }
+
+
+def add_technical_flag(
+    output_dir: Path,
+    *,
+    flag: str,
+    severity: str,
+    risk: str,
+    reason: str,
+    recommended_action: str,
+    source: str = "pipeline",
+) -> dict[str, Any]:
+    ensure_review_artifacts(output_dir)
+    review_dir = _review_dir(Path(output_dir))
+    technical_path = review_dir / "technical_flags.json"
+    data = _read_json(technical_path)
+    flags = data.setdefault("flags", [])
+    if not isinstance(flags, list):
+        raise ValueError("technical_flags.json поврежден.")
+    item = {
+        "id": f"tech-{_next_prefixed_index([entry for entry in flags if isinstance(entry, dict)], 'tech'):06d}",
+        "flag": flag,
+        "severity": _audit_severity(severity),
+        "risk": risk if risk in {"low", "medium", "high"} else "medium",
+        "reason": reason,
+        "recommendedAction": recommended_action,
+        "status": "pending",
+        "source": source,
+        "createdAt": _now(),
+    }
+    key = _technical_flag_key(item)
+    if key in {_technical_flag_key(entry) for entry in flags if isinstance(entry, dict)}:
+        return {"added": False, "flag": item}
+    flags.append(item)
+    data["updatedAt"] = _now()
+    _write_json(technical_path, data)
+    return {"added": True, "flag": item}
+
+
+def _is_projectable_text_audit(suggestion: dict[str, Any]) -> bool:
+    return (
+        suggestion.get("category") in AUDIT_TEXT_CHANGE_CATEGORIES
+        and suggestion.get("action") in {"replace_text", "add_punctuation", "change_case"}
+        and suggestion.get("requiresAudioReview") is False
+    )
+
+
+def _is_audio_audit_candidate(suggestion: dict[str, Any]) -> bool:
+    return (
+        suggestion.get("category") in AUDIO_REVIEW_AUDIT_CATEGORIES
+        or suggestion.get("action") == "mark_audio_review"
+    )
+
+
+def _audit_suggestion_to_correction(
+    suggestion: dict[str, Any],
+    segment: dict[str, Any],
+    index: int,
+    run_id: str,
+    source: str,
+) -> dict[str, Any] | None:
+    original = _text(suggestion.get("originalText")).strip()
+    suggested = _text(suggestion.get("suggestedText")).strip()
+    segment_text = _text(segment.get("text"))
+    if not original or not suggested or original not in segment_text or _is_noop_text_change(original, suggested):
+        return None
+    category = "PUNCTUATION" if suggestion.get("category") == "ASR_PUNCTUATION" else "ASR_ERROR"
+    return {
+        "id": f"corr-{index:06d}",
+        "segmentId": segment["id"],
+        "category": category,
+        "severity": _correction_severity(suggestion.get("severity")),
+        "confidence": round(_float(suggestion.get("confidence")), 3),
+        "originalText": original,
+        "suggestedText": suggested,
+        "reason": _text(suggestion.get("reason")),
+        "requiresAudioReview": False,
+        "canBatchApply": bool(suggestion.get("canAutoApply")),
+        "status": "pending",
+        "source": source,
+        "sourceRunId": run_id,
+        "startTime": segment.get("start"),
+        "endTime": segment.get("end"),
+    }
+
+
+def _audit_suggestion_to_audio_flag(
+    suggestion: dict[str, Any],
+    segment: dict[str, Any],
+    index: int,
+    run_id: str,
+    source: str,
+) -> dict[str, Any]:
+    text = _text(suggestion.get("originalText") or suggestion.get("suggestedText") or suggestion.get("reason")).strip()
+    return {
+        "id": f"flag-{index:06d}",
+        "segmentId": segment["id"],
+        "category": _text(suggestion.get("category")) or "AUDIO_REVIEW",
+        "severity": _audit_severity(suggestion.get("severity")),
+        "confidence": round(_float(suggestion.get("confidence")), 3),
+        "text": text,
+        "reason": _text(suggestion.get("reason")),
+        "status": "pending",
+        "startTime": segment.get("start"),
+        "endTime": segment.get("end"),
+        "source": source,
+        "sourceRunId": run_id,
+    }
+
+
+def _audit_suggestion_to_review_item(
+    suggestion: dict[str, Any],
+    segment: dict[str, Any],
+    index: int,
+    run_id: str,
+    source: str,
+) -> dict[str, Any]:
+    return {
+        "id": f"audit-{index:06d}",
+        "segmentId": segment["id"],
+        "involvedSegmentIds": suggestion.get("involvedSegmentIds", []),
+        "category": suggestion.get("category"),
+        "action": suggestion.get("action"),
+        "severity": _audit_severity(suggestion.get("severity")),
+        "risk": suggestion.get("risk"),
+        "confidence": round(_float(suggestion.get("confidence")), 3),
+        "originalText": _text(suggestion.get("originalText")),
+        "suggestedText": _text(suggestion.get("suggestedText")),
+        "reason": _text(suggestion.get("reason")),
+        "requiresAudioReview": bool(suggestion.get("requiresAudioReview")),
+        "canAutoApply": bool(suggestion.get("canAutoApply")),
+        "evidence": suggestion.get("evidence", []),
+        "status": "pending",
+        "source": source,
+        "sourceRunId": run_id,
+        "startTime": segment.get("start"),
+        "endTime": segment.get("end"),
+    }
+
+
+def _technical_flag_from_suggestion(
+    suggestion: dict[str, Any],
+    index: int,
+    run_id: str,
+    source: str,
+) -> dict[str, Any]:
+    return {
+        "id": f"tech-{index:06d}",
+        "flag": _text(suggestion.get("action") or suggestion.get("category")),
+        "severity": _audit_severity(suggestion.get("severity")),
+        "risk": suggestion.get("risk") if suggestion.get("risk") in {"low", "medium", "high"} else "medium",
+        "reason": _text(suggestion.get("reason")),
+        "recommendedAction": _text(suggestion.get("suggestedText") or "Проверить технический флаг вручную."),
+        "status": "pending",
+        "source": source,
+        "sourceRunId": run_id,
+    }
+
+
+def _technical_flag_from_payload(
+    flag: dict[str, Any],
+    index: int,
+    run_id: str,
+    source: str,
+) -> dict[str, Any]:
+    return {
+        "id": f"tech-{index:06d}",
+        "flag": _text(flag.get("flag")),
+        "severity": _audit_severity(flag.get("severity")),
+        "risk": flag.get("risk") if flag.get("risk") in {"low", "medium", "high"} else "medium",
+        "reason": _text(flag.get("reason")),
+        "recommendedAction": _text(flag.get("recommendedAction")),
+        "status": "pending",
+        "source": source,
+        "sourceRunId": run_id,
+    }
+
+
+def _glossary_segment_ids(suggestions: list[Any], segments: dict[str, dict[str, Any]]) -> dict[str, set[str]]:
+    result: dict[str, set[str]] = defaultdict(set)
+    for suggestion in suggestions:
+        if not isinstance(suggestion, dict) or suggestion.get("category") != "GLOSSARY_ENTITY":
+            continue
+        segment_id = _text(suggestion.get("segmentId"))
+        if segment_id not in segments:
+            continue
+        for value in (suggestion.get("originalText"), suggestion.get("suggestedText")):
+            key = _entity_key(_text(value))
+            if key:
+                result[key].add(segment_id)
+    return result
+
+
+def _segment_ids_by_speaker(segments: dict[str, dict[str, Any]]) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = defaultdict(list)
+    for segment_id, segment in segments.items():
+        speaker = _text(segment.get("speaker"))
+        if speaker:
+            result[speaker].append(segment_id)
+    return result
+
+
+def _speaker_map_to_review_item(
+    speaker_suggestion: dict[str, Any],
+    segment_ids_by_speaker: dict[str, list[str]],
+    index: int,
+    run_id: str,
+    source: str,
+) -> dict[str, Any] | None:
+    speaker_label = _text(speaker_suggestion.get("speakerLabel"))
+    segment_ids = segment_ids_by_speaker.get(speaker_label, [])
+    if not segment_ids:
+        return None
+    proposed_name = _text(speaker_suggestion.get("proposedName"))
+    proposed_role = _text(speaker_suggestion.get("proposedRole"))
+    suggested = " · ".join(item for item in (proposed_name, proposed_role) if item) or speaker_label
+    return {
+        "id": f"audit-{index:06d}",
+        "segmentId": segment_ids[0],
+        "involvedSegmentIds": segment_ids,
+        "speakerLabel": speaker_label,
+        "category": "SPEAKER_MAP_SUGGESTION",
+        "action": "relabel_speaker",
+        "severity": "medium",
+        "risk": "medium",
+        "confidence": round(_float(speaker_suggestion.get("confidence")), 3),
+        "originalText": speaker_label,
+        "suggestedText": suggested,
+        "reason": _text(speaker_suggestion.get("reason")),
+        "requiresAudioReview": bool(speaker_suggestion.get("requiresReview")),
+        "canAutoApply": False,
+        "evidence": [],
+        "status": "pending",
+        "source": source,
+        "sourceRunId": run_id,
+    }
+
+
+def _glossary_to_entity(
+    glossary_item: dict[str, Any],
+    segment_ids_by_term: dict[str, set[str]],
+    index: int,
+    run_id: str,
+    source: str,
+) -> dict[str, Any]:
+    term = _text(glossary_item.get("term")).strip()
+    canonical = _text(glossary_item.get("canonical")).strip() or term
+    key = _entity_key(term)
+    return {
+        "id": f"ent-{index:06d}",
+        "surface": term,
+        "canonical": canonical,
+        "type": _glossary_type(_text(glossary_item.get("type"))),
+        "verificationStatus": _glossary_status(_text(glossary_item.get("status"))),
+        "verifierConfidence": round(_float(glossary_item.get("confidence")), 3),
+        "evidence": [
+            {
+                "source": source,
+                "snippet": _text(glossary_item.get("reason")),
+                "sourceRunId": run_id,
+            }
+        ],
+        "status": "pending",
+        "segmentIds": sorted(segment_ids_by_term.get(key, set())),
+        "source": source,
+        "sourceRunId": run_id,
+    }
+
+
+def _correction_severity(value: Any) -> str:
+    severity = _text(value)
+    return severity if severity in {"low", "medium", "high"} else "high"
+
+
+def _audit_severity(value: Any) -> str:
+    severity = _text(value)
+    return severity if severity in {"low", "medium", "high", "critical"} else "medium"
+
+
+def _glossary_type(value: str) -> str:
+    mapping = {
+        "person": "PERSON",
+        "organization": "ORG",
+        "number": "NUMBER",
+        "date": "DATE",
+    }
+    return mapping.get(value, "TERM")
+
+
+def _glossary_status(value: str) -> str:
+    if value in {"confirmed_by_context", "confirmed_by_evidence"}:
+        return "confirmed"
+    if value == "requires_external_check":
+        return "not_found"
+    return "uncertain"
+
+
+def _audio_flag_key(flag: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        _text(flag.get("segmentId")),
+        _text(flag.get("category")),
+        _normalize_whitespace(_text(flag.get("text"))).casefold(),
+    )
+
+
+def _audit_suggestion_key(suggestion: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    return (
+        _text(suggestion.get("segmentId")),
+        _text(suggestion.get("category")),
+        _text(suggestion.get("action")),
+        _normalize_whitespace(_text(suggestion.get("originalText"))).casefold(),
+        _normalize_whitespace(_text(suggestion.get("suggestedText"))).casefold(),
+    )
+
+
+def _technical_flag_key(flag: dict[str, Any]) -> tuple[str, str]:
+    return (
+        _normalize_whitespace(_text(flag.get("flag"))).casefold(),
+        _normalize_whitespace(_text(flag.get("reason"))).casefold(),
+    )
 
 
 def is_safe_asr_correction(correction: dict[str, Any]) -> bool:

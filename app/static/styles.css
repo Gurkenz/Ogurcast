@@ -414,6 +414,35 @@ code {
   margin-bottom: 12px;
 }
 
+.llm-audit-status,
+.review-warning {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  background: #fff;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.llm-audit-status.failed,
+.review-warning {
+  border-color: var(--danger);
+  background: var(--danger-bg);
+}
+
+.llm-audit-status.queued,
+.llm-audit-status.running,
+.llm-audit-status.not_started {
+  border-color: var(--warn);
+  background: var(--warn-bg);
+}
+
+.llm-audit-status.done {
+  border-color: var(--success);
+  background: var(--success-bg);
+}
+
 .mode-tabs,
 .workbench-actions {
   display: flex;

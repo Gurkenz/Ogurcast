@@ -117,10 +117,13 @@ def llm_status() -> dict[str, object]:
     client = OpenAICompatibleLLMClient(settings)
     status = client.model_status()
     return {
+        "provider": settings.provider,
         "baseUrl": settings.base_url,
         "configuredModel": settings.model,
         "temperature": settings.temperature,
         "timeoutSec": settings.timeout_sec,
+        "llamaServerExe": settings.llama_server_exe if settings.provider == "llamacpp" else None,
+        "llamaModelPath": settings.llama_model_path if settings.provider == "llamacpp" else None,
         "hasApiKey": bool(settings.api_key),
         **status,
     }

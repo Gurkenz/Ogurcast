@@ -8,7 +8,7 @@ New-Item -ItemType Directory -Force -Path $ProjectRoot | Out-Null
 Set-Location $ProjectRoot
 
 New-Item -ItemType Directory -Force -Path `
-  "scripts", "app", "app\static", "uploads", "outputs", "logs", "models", "models\asr", "models\align", "models\diarization", "tmp", ".cache", ".cache\huggingface", ".cache\torch", ".cache\pip", ".cache\nltk", "tools" | Out-Null
+  "scripts", "app", "app\static", "uploads", "outputs", "logs", "models", "models\asr", "models\align", "models\diarization", "models\llm", "tmp", ".cache", ".cache\huggingface", ".cache\torch", ".cache\pip", ".cache\nltk", "tools" | Out-Null
 
 if (-not (Test-Path ".env")) {
     Copy-Item -LiteralPath ".env.example" -Destination ".env"

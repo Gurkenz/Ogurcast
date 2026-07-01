@@ -12,7 +12,7 @@ from app.llm_client import LLMSettings
 
 
 LOCAL_PROFILE_PATH = PROJECT_ROOT / "config" / "llm_profiles.local.json"
-SUPPORTED_STAGES = {"asr_correction"}
+SUPPORTED_STAGES = {"asr_correction", "diarized_asr_audit"}
 
 ASR_CORRECTION_SCHEMA: dict[str, Any] = {
     "version": 1,
@@ -30,6 +30,66 @@ ASR_CORRECTION_SCHEMA: dict[str, Any] = {
             "canBatchApply": False,
         }
     ],
+}
+
+DIARIZED_ASR_AUDIT_SCHEMA: dict[str, Any] = {
+    "version": "1",
+    "task": "diarized_asr_audit",
+    "chunkId": "chunk_0001",
+    "suggestions": [
+        {
+            "segmentId": "seg-000001",
+            "involvedSegmentIds": [],
+            "category": "ASR_OBVIOUS|ASR_PUNCTUATION|ASR_ENTITY_UNCERTAIN|ASR_LOW_CONFIDENCE|ASR_LOOP|DIARIZATION_WRONG_SPEAKER|DIARIZATION_BOUNDARY|DIARIZATION_INTRASEGMENT_SHIFT|DIARIZATION_EMBEDDED_REPLY|DIARIZATION_MICROSEGMENT|SERVICE_FRAGMENT|SOURCE_CONFLICT|AUDIO_REVIEW|GLOSSARY_ENTITY|TECHNICAL_FLAG",
+            "action": "replace_text|add_punctuation|change_case|split_segment|merge_segments|move_text_to_previous_segment|move_text_to_next_segment|relabel_speaker|mark_service_fragment|mark_audio_review|add_glossary_entry|flag_source_conflict|flag_technical_issue|keep_unchanged",
+            "severity": "low|medium|high|critical",
+            "risk": "low|medium|high",
+            "confidence": 0.0,
+            "canAutoApply": False,
+            "requiresAudioReview": True,
+            "originalText": "exact text from segment, or empty for non-text findings",
+            "suggestedText": "replacement/action target, or empty",
+            "reason": "short Russian reason",
+            "evidence": [{"type": "context|word_score|avg_logprob|speaker_shift|source_conflict|metadata|entity_evidence|pattern", "value": "evidence"}],
+        }
+    ],
+    "speakerMapSuggestions": [
+        {
+            "speakerLabel": "SPEAKER_00",
+            "proposedRole": "unknown",
+            "proposedName": "",
+            "confidence": 0.0,
+            "reason": "short Russian reason",
+            "requiresReview": True,
+        }
+    ],
+    "glossary": [
+        {
+            "term": "term from transcript",
+            "type": "person|organization|project|event|drug|medical_term|technical_term|abbreviation|number|date|other",
+            "canonical": "canonical spelling",
+            "status": "confirmed_by_context|confirmed_by_evidence|requires_audio_review|requires_external_check|uncertain",
+            "confidence": 0.0,
+            "reason": "short Russian reason",
+        }
+    ],
+    "technicalFlags": [
+        {
+            "flag": "flag_name",
+            "severity": "low|medium|high|critical",
+            "risk": "low|medium|high",
+            "reason": "short Russian reason",
+            "recommendedAction": "what the reviewer or pipeline should do",
+        }
+    ],
+    "summary": {
+        "hasCriticalIssues": False,
+        "autoApplyCount": 0,
+        "audioReviewCount": 0,
+        "diarizationIssueCount": 0,
+        "asrIssueCount": 0,
+        "entityIssueCount": 0,
+    },
 }
 
 DEFAULT_ASR_SYSTEM_INSTRUCTION = (
@@ -54,6 +114,33 @@ DEFAULT_USER_PAYLOAD_TEMPLATE = (
     "{input_json}"
 )
 
+DEFAULT_AUDIT_SYSTEM_INSTRUCTION = (
+    "You are Ogurcast ASR Audit Engine. "
+    "Return only one valid JSON object. No markdown. No prose outside JSON. "
+    "Analyze diarized Russian ASR transcript chunks and produce atomic audit suggestions for later human review. "
+    "You do not edit the transcript directly. You do not rewrite spoken language for style. "
+    "Do not polish, summarize, shorten, normalize live speech, remove repetitions, or improve readability. "
+    "Use only the provided input: segments, word-level data, adjacent context, speaker turns, low confidence words, "
+    "metadata, technical signals, source conflicts, entity evidence, and glossary candidates. "
+    "Do not invent audio, speakers, facts, sources, or external verification. "
+    "Every suggestion must reference existing segmentId values from the input. "
+    "For text corrections originalText must be an exact substring of the input segment text and suggestedText must be only the replacement. "
+    "If a correction is uncertain, or changes a name, organization, drug, medical term, number, date, dose, legal term, technical term, "
+    "speaker identity, or factual claim, set requiresAudioReview=true and canAutoApply=false unless the input evidence makes it unambiguous. "
+    "Ignore low score on short service words unless it changes meaning, negation, number, entity, or speaker boundary. "
+    "Report diarization boundary shifts, intrasegment speaker shifts, embedded replies, microsegments, ASR loops, source conflicts, "
+    "service fragments, glossary entities, and technical pipeline flags using the allowed categories/actions. "
+    "Reason fields must be short Russian explanations. Do not include hidden reasoning."
+)
+
+DEFAULT_AUDIT_USER_PAYLOAD_TEMPLATE = (
+    "Task: audit diarized Russian ASR transcript chunk.\n\n"
+    "Return strictly valid JSON matching this schema:\n"
+    "{output_schema_json}\n\n"
+    "Input JSON:\n"
+    "{input_json}"
+)
+
 
 class LLMProfile(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -70,6 +157,8 @@ class LLMProfile(BaseModel):
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     timeoutSec: float | None = Field(default=None, gt=0.0, le=600.0)
     maxInputChars: int = Field(default=18000, ge=1000, le=200000)
+    chunkSegmentCount: int = Field(default=40, ge=1, le=200)
+    chunkOverlap: int = Field(default=3, ge=0, le=20)
 
     @field_validator("stage")
     @classmethod
@@ -127,7 +216,29 @@ def default_profiles() -> dict[str, LLMProfile]:
             temperature=env_settings.temperature,
             timeoutSec=env_settings.timeout_sec,
             maxInputChars=18000,
-        )
+        ),
+        "diarized_asr_audit": LLMProfile(
+            stage="diarized_asr_audit",
+            profileId="default-diarized-asr-audit",
+            version=1,
+            label="Diarized ASR audit",
+            stageDescription=(
+                "Аудит диаризированной ASR-расшифровки: ASR-ошибки, диаризация, "
+                "границы реплик, сущности, низкая уверенность и технические флаги."
+            ),
+            systemInstruction=DEFAULT_AUDIT_SYSTEM_INSTRUCTION,
+            userPayloadTemplate=DEFAULT_AUDIT_USER_PAYLOAD_TEMPLATE,
+            schemaNotes=(
+                "LLM возвращает только объект LLMAuditResponse. "
+                "Сервер сам проецирует findings в corrections/audio_flags/entities/audit_suggestions/technical_flags."
+            ),
+            defaultModel=env_settings.model,
+            temperature=0.05,
+            timeoutSec=180,
+            maxInputChars=120000,
+            chunkSegmentCount=40,
+            chunkOverlap=3,
+        ),
     }
 
 
@@ -197,8 +308,7 @@ def save_local_profile(stage: str, payload: dict[str, Any]) -> LLMProfile:
 
 
 def render_messages(profile: LLMProfile, input_payload: dict[str, Any], model: str) -> list[dict[str, str]]:
-    schema = dict(ASR_CORRECTION_SCHEMA)
-    schema["model"] = model
+    schema = _schema_for_stage(profile.stage, model)
     user_content = profile.userPayloadTemplate.replace(
         "{output_schema_json}",
         json.dumps(schema, ensure_ascii=False, indent=2),
@@ -210,6 +320,14 @@ def render_messages(profile: LLMProfile, input_payload: dict[str, Any], model: s
         {"role": "system", "content": profile.systemInstruction},
         {"role": "user", "content": user_content},
     ]
+
+
+def _schema_for_stage(stage: str, model: str) -> dict[str, Any]:
+    if stage == "diarized_asr_audit":
+        return dict(DIARIZED_ASR_AUDIT_SCHEMA)
+    schema = dict(ASR_CORRECTION_SCHEMA)
+    schema["model"] = model
+    return schema
 
 
 def profile_hash(profile: LLMProfile, messages: list[dict[str, str]]) -> str:
